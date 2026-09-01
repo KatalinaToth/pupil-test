@@ -1,0 +1,1322 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Two-minute pupil test</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+
+
+<script src="vendor/tf.min.js"></script>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 15px/1.55 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+         background: #6f6f6f; color: #111; }
+  #intro, #report { max-width: 780px; margin: 0 auto; padding: 28px 22px 60px; }
+  .panel { background: rgb(112,131,149); border-radius: 12px; padding: 20px 24px; }
+  h1 { font-size: 22px; margin: 0 0 10px; }
+  h2 { font-size: 16px; margin: 22px 0 8px; }
+  ul { padding-left: 22px; } li { margin-bottom: 6px; }
+  button { font: inherit; font-weight: 650; padding: 12px 22px; border: 0; border-radius: 9px;
+           background: rgb(164,99,210); color: #000; cursor: pointer; }
+  button[disabled] { opacity: .5; cursor: default; }
+  /* The stimulus screen: nothing but a flat field and a fixation cross. */
+  #stim { position: fixed; inset: 0; display: none; place-items: center; z-index: 10; }
+  #stim.on { display: grid; }
+  #cross { font-size: 42px; font-weight: 300; }
+  #phase { position: fixed; bottom: 10px; right: 14px; font-size: 11px; opacity: .35; }
+  table { border-collapse: collapse; width: 100%; margin: 10px 0; font-size: 13.5px; }
+  th, td { border: 1px solid rgb(90,90,90); padding: 6px 9px; text-align: left; }
+  .verdict { border-radius: 10px; padding: 14px 16px; margin: 14px 0; font-size: 15px; }
+  .good { background: #cdebd8; } .weak { background: #f6e6c2; } .bad { background: #f0cfcf; }
+  code { background: rgba(0,0,0,.12); padding: 1px 5px; border-radius: 4px; }
+</style>
+</head>
+<body>
+
+<div id="intro"><div class="panel">
+  <h1>Two-minute pupil test</h1>
+  <p>Thanks for helping! This tests whether our software can measure your pupils with an
+  ordinary webcam. Your pupils shrink when the screen gets brighter — it happens on its
+  own, you cannot get it wrong — and the software has to see that happen.</p>
+
+  <h2>What will happen — about 2 minutes</h2>
+  <ul>
+    <li>The page goes full screen and asks to use your camera.</li>
+    <li>A grey screen for 15 seconds while it calibrates.</li>
+    <li>Then it alternates <b>dark</b> and <b>bright</b> screens, 10 seconds each, four times.</li>
+    <li>Look at the cross in the middle, blink normally. If the bright screens make you
+    squint, squint — that is fine and useful.</li>
+  </ul>
+
+  <h2>Before you press Begin</h2>
+  <ul>
+    <li><b>Sit about an arm's length from the screen</b>, whole face visible.</li>
+    <li><b>Keep the room lighting steady</b> — the screen should be the only thing changing.</li>
+    <li>Glasses on if you wear them. Everything as normal.</li>
+  </ul>
+
+  <p><b>Privacy:</b> the camera turns on when you press Begin and is released the moment
+  the test ends. <b>No video is recorded and nothing is uploaded anywhere</b> — the page
+  computes numbers on your machine, and at the end you download a small results file and
+  send it back yourself.</p>
+
+  <p>A name or initials for your results file (so we know whose it is):<br>
+  <input id="pid" type="text" maxlength="24" placeholder="e.g. GK"
+         style="font:inherit;padding:8px;border-radius:6px;border:1px solid #777;width:200px"></p>
+
+  <p><button id="go">Begin</button></p>
+  <p id="status" style="font-size:13px"></p>
+  <div id="stale" class="verdict bad" style="display:none"></div>
+</div></div>
+<div id="stim"><div id="cross">+</div></div>
+<div id="phase"></div>
+<div id="report" style="display:none"></div>
+
+<script>
+"use strict";
+
+// Periods, in order. Grey first so calibration happens under neutral light, as it
+// would in a real study; then four dark/bright pairs.
+const CAL_MS = 15000, PERIOD_MS = 10000, CYCLES = 4;
+const DARK = "#101010", BRIGHT = "#ededed", GREY = "rgb(128,128,128)";
+// Discarded at the start of each period: the reflex takes a moment, and the first
+// second after a big luminance step is a transient, not a level.
+const SKIP_MS = 2500;
+
+const $ = (id) => document.getElementById(id);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const setStatus = (s) => { $("status").textContent = s; };
+
+/* ---- loading our own code, and refusing to run the wrong version of it ----
+   Fetch with cache:"reload" so the browser must go to the server, then run the text as a
+   script. One extra request each for two small files; a stale copy of either costs a whole
+   session. */
+async function loadFresh(url) {
+  const r = await fetch(url, { cache: "reload" });
+  if (!r.ok) throw new Error(url + " -> HTTP " + r.status);
+  const s = document.createElement("script");
+  s.textContent = await r.text();
+  document.head.appendChild(s);
+}
+
+/* Things this harness reads out of the engine. If the engine cannot supply one of them it
+   is not the engine this page was written against, and the run would produce a report with
+   holes in it that LOOKS complete. So it is checked BEFORE the camera opens, and it stops
+   the run rather than warning about it — a warning is exactly what got ignored last time
+   (the code said `engine.getFrameDiagnostics ? ... : []`, which turned a missing feature
+   into an empty array and then into a blank row in the table). */
+const REQUIRED_METHODS = ["getFrameDiagnostics", "getRejectionEvents"];
+const REQUIRED_STATS = ["mean_diameter_crop_px_area", "mean_diameter_crop_px_edge", "crop_px_to_pseudo_mm", "frame_diag_fields", "rejection_event_fields", "iris_source_px_mean"];
+/* Fields this harness reads out of each per-frame diagnostic entry. The engine names what
+   it records (frame_diag_fields), so an engine that predates a field is caught here — the
+   presence of getFrameDiagnostics() alone proved insufficient the first time. */
+const REQUIRED_FRAME_FIELDS = ["t", "ok", "interior", "exterior", "contrast", "brightInside", "dAreaPx", "dEdgePx", "repairPx", "dAreaRawPx", "candP95", "repairCut", "vetoed"];
+/* Same contract for rejection events: the damaged-or-real verdict reads the size, eye and
+   reflection measured at the moment each reading was refused. */
+const REQUIRED_REJECT_FIELDS = ["t", "reason", "value", "eye", "bright", "contrast"];
+
+function engineApiProblems(engine) {
+  const missing = [];
+  for (const m of REQUIRED_METHODS) if (typeof engine[m] !== "function") missing.push(m + "()");
+  let stats = {};
+  try { stats = engine.getCalibration() || {}; } catch (e) { missing.push("getCalibration() threw: " + e.message); }
+  for (const f of REQUIRED_STATS) if (!(f in stats)) missing.push(f);
+  const fdf = stats.frame_diag_fields;
+  if (Array.isArray(fdf)) {
+    for (const f of REQUIRED_FRAME_FIELDS) if (!fdf.includes(f)) missing.push("frame field " + f);
+  }
+  const ref = stats.rejection_event_fields;
+  if (Array.isArray(ref)) {
+    for (const f of REQUIRED_REJECT_FIELDS) if (!ref.includes(f)) missing.push("rejection field " + f);
+  }
+  return missing;
+}
+
+function showStaleBanner(missing) {
+  const el = $("stale");
+  el.innerHTML = "<b>Stopped before the camera opened: your browser is running an old copy "
+    + "of the pupil engine.</b><p>Nothing is wrong with your setup and nothing is wrong with "
+    + "you — the browser kept a saved copy of the code. Press the button below, then press "
+    + "Begin again.</p><p style='font-size:12.5px;opacity:.85'>Missing from the engine: <code>"
+    + missing.join("</code>, <code>") + "</code></p>"
+    + "<p><button id='purge'>Clear the saved copy and reload</button></p>";
+  el.style.display = "block";
+  $("purge").addEventListener("click", async () => {
+    try {
+      await Promise.all(OUR_BUNDLES.map((u) => fetch(u, { cache: "reload" })));
+      if (window.caches) for (const k of await caches.keys()) await caches.delete(k);
+    } catch (e) { /* reload anyway */ }
+    location.reload();
+  });
+}
+
+const OUR_BUNDLES = [
+  "dist/biometrics-core.global.js",
+  "dist/biometrics-pupil-meye.global.js",
+];
+
+/* ---- ask the camera to hold its brightness steady ----
+   The biggest suspected artefact is the webcam turning its own sensitivity down when the
+   bright screen lights the face, which fades the pupil-iris boundary. Some cameras let a
+   page switch exposure to "manual", which freezes it at its current level — removing that
+   mechanism at the source instead of measuring it after the fact. Support is spotty
+   (commonest on Chrome with some cameras; often absent on Macs), so this TRIES, and
+   reports what happened either way; the "Is it your pupil, or the camera?" table still
+   catches dimming if the lock was refused. Escape hatch: ?nolock=1 skips the attempt.
+   NOTE for anyone copying this into a study: with exposure locked, a bright screen makes
+   the face image BRIGHTER (nothing compensates any more). That is the point — the pupil
+   boundary stays crisp — but it changes the image statistics, so a study should either
+   lock for everyone or for no one, never a mixture. */
+async function tryLockCameraExposure(rec) {
+  const out = { attempted: true, supported: false, applied: false, note: "" };
+  try {
+    const track = rec.stream && rec.stream.getVideoTracks ? rec.stream.getVideoTracks()[0] : null;
+    if (!track) { out.note = "no camera track exposed by the recorder"; return out; }
+    const caps = track.getCapabilities ? track.getCapabilities() : null;
+    if (!caps || !Array.isArray(caps.exposureMode) || !caps.exposureMode.includes("manual")) {
+      out.note = "this camera/browser does not offer a manual exposure mode"
+        + (caps && caps.exposureMode ? " (offers: " + caps.exposureMode.join(", ") + ")" : "");
+      return out;
+    }
+    out.supported = true;
+    await track.applyConstraints({ advanced: [{ exposureMode: "manual" }] });
+    const st = track.getSettings ? track.getSettings() : {};
+    out.applied = st.exposureMode === "manual";
+    out.note = out.applied
+      ? "held at the grey-screen level for the whole test"
+      : "the camera accepted the request but stayed in mode \"" + st.exposureMode + "\"";
+  } catch (e) {
+    out.note = "the camera refused: " + (e && e.message ? e.message : e);
+  }
+  return out;
+}
+
+$("go").addEventListener("click", async () => {
+  $("go").disabled = true;
+  $("stale").style.display = "none";
+  try {
+    setStatus("Loading the toolkit…");
+    for (const u of OUR_BUNDLES) await loadFresh(u);
+  } catch (e) {
+    setStatus("The toolkit bundles did not load (" + e.message + ") — serve the repo root over HTTP.");
+    $("go").disabled = false; return;
+  }
+  const Core = window.BiometricsCore, Meye = window.BiometricsPupilMeye;
+  if (!Core || !Meye) { setStatus("The toolkit bundles did not load — serve the repo root over HTTP."); $("go").disabled = false; return; }
+
+  let rec = null;
+  try {
+    setStatus("Loading the models…");
+    // ?roi=iris (&im=1.8) runs the iris-centred crop instead of the default
+    // eye-width one, so the two can be compared against the same ground truth.
+    const qs = new URLSearchParams(location.search);
+    const opts = { modelUrl: "models/meye-segmentation_i128_s4_c1_f16_g1_a-relu-no-subj/model.json" };
+    if (qs.get("roi")) opts.roiMode = qs.get("roi");
+    if (qs.get("im")) opts.irisMargin = parseFloat(qs.get("im"));
+    if (qs.get("fill")) opts.minFill = parseFloat(qs.get("fill"));
+    // ?norepair=1 turns off the reflection repair, so a run with and a run without can
+    // be compared on the same person if the repair is ever suspected of overreaching.
+    if (qs.get("norepair")) opts.reflectionRepair = false;
+    // ?src=area / ?src=edge / ?src=width overrides which estimator becomes the reading,
+    // so the default switch (edge, 27 Aug 2026) stays reversible per run for comparison.
+    if (qs.get("src")) opts.diameterFrom = qs.get("src");
+    const engine = new Meye.MeyePupilEngine(opts);
+    // Version check, before the camera. See engineApiProblems above.
+    const missing = engineApiProblems(engine);
+    if (missing.length) { setStatus(""); showStaleBanner(missing); $("go").disabled = false; return; }
+    rec = new Core.BiometricRecorder({
+      modalities: { expressions: false, heartRate: false, headPose: false, pupil: true, gaze: false },
+      pupilModel: null
+    });
+    rec.attachPupilEngine(engine);
+    await rec.init();
+    if (!engine.ready) { setStatus("The pupil model did not load: " + engine.loadError); return; }
+
+    try { await document.documentElement.requestFullscreen({ navigationUI: "hide" }); } catch (e) { /* optional */ }
+    setStatus("Asking for the camera…");
+    await rec.start();                       // opens the webcam
+    $("intro").style.display = "none";
+    $("stim").classList.add("on");
+
+    // ---- run the sequence, recording the real clock bounds of each period ----
+    const periods = [];
+    const runPeriod = async (kind, colour, ms) => {
+      $("stim").style.background = colour;
+      $("cross").style.color = kind === "bright" ? "#333" : "#bbb";
+      $("phase").textContent = kind;
+      const t0 = rec.now();
+      await sleep(ms);
+      periods.push({ kind, t0, t1: rec.now() });
+    };
+
+    /* Lock the camera's brightness a few seconds INTO the grey calibration screen: by
+       then the camera has settled at a neutral level, and freezing it there does not
+       change the image mid-calibration (manual mode keeps the current values). Run as a
+       side task so the period clock is untouched. */
+    let exposureLock = { attempted: false, supported: false, applied: false, note: "skipped (?nolock=1)" };
+    const lockTask = qs.get("nolock") ? Promise.resolve() : (async () => {
+      await sleep(4000);
+      exposureLock = await tryLockCameraExposure(rec);
+    })();
+
+    await runPeriod("calibration", GREY, CAL_MS);
+    for (let c = 0; c < CYCLES; c++) {
+      await runPeriod("dark", DARK, PERIOD_MS);
+      await runPeriod("bright", BRIGHT, PERIOD_MS);
+    }
+    await lockTask;
+
+    $("stim").classList.remove("on");
+    $("phase").textContent = "";
+    /* Per-frame image diagnostics, read BEFORE stop() in case stopping clears engine
+       state. The engine cannot split these by condition — it does not know which trial a
+       frame is in — so the harness does it below. */
+    const frameDiag = engine.getFrameDiagnostics();
+    const rejects = engine.getRejectionEvents();
+    const result = await rec.stop();          // releases the camera
+    try { if (document.fullscreenElement) await document.exitFullscreen(); } catch (e) { /* ignore */ }
+    report(result, rec, periods, frameDiag, rejects, exposureLock);
+  } catch (err) {
+    setStatus("Failed: " + (err && err.message ? err.message : err));
+    try { if (rec) await rec.stop(); } catch (e) { /* ignore */ }
+  }
+});
+
+function report(result, rec, periods, frameDiag, rejects, exposureLock) {
+  const pupil = result.pupil || {};
+  const cal = pupil.calibration || {};
+  const samples = rec.getPupilSamples() || { t_sec: [], mean_mm: [], blink: [] };
+  const t = samples.t_sec || [], mm = samples.mean_mm || [], bl = samples.blink || [];
+  const any = samples.mean_mm_any_eye || [];
+  const lft = samples.left_mm || [], rgt = samples.right_mm || [];
+
+  const avg = (v) => (v.length ? v.reduce((a, b) => a + b, 0) / v.length : null);
+
+  /* Mean pupil per period, discarding the reflex latency at each onset.
+     Computed twice on purpose. `mean` uses readings where BOTH eyes were
+     measured; `mean_any` allows a single eye, which is what this test used to do.
+     They are reported side by side because the eyes do not drop out at random —
+     a constricted pupil is the hardest thing to segment, so bright periods lose
+     an eye most often, and that alone can move the headline number. If the two
+     columns disagree, the disagreement IS the finding. */
+  const rows = periods.map((p) => {
+    const from = (p.t0 + SKIP_MS) / 1000, to = p.t1 / 1000;
+    const vals = [], valsAny = [];
+    let blinks = 0, oneEye = 0;
+    for (let i = 0; i < t.length; i++) {
+      if (t[i] < from || t[i] > to) continue;
+      if (bl[i]) { blinks++; continue; }
+      if (mm[i] != null) vals.push(mm[i]);
+      else if (any[i] != null) oneEye++;
+      if (any[i] != null) valsAny.push(any[i]);
+    }
+    return { ...p, n: vals.length, n_any: valsAny.length, one_eye: oneEye, blinks,
+             mean: avg(vals), mean_any: avg(valsAny) };
+  });
+
+  const meanOf = (kind, key) => avg(rows.filter((r) => r.kind === kind && r[key] != null).map((r) => r[key]));
+  const dark = meanOf("dark", "mean"), bright = meanOf("bright", "mean");
+  const pct = (dark && bright) ? ((bright - dark) / dark) * 100 : null;
+  const darkAny = meanOf("dark", "mean_any"), brightAny = meanOf("bright", "mean_any");
+  const pctAny = (darkAny && brightAny) ? ((brightAny - darkAny) / darkAny) * 100 : null;
+
+  /* ---- Does the measurement actually track the pupil? ----
+   *
+   * An earlier version of this file answered that with the correlation between the
+   * two eyes, pooled over the whole session, and called it "the strongest check
+   * available". That was WRONG, and the mistake is worth spelling out because it is
+   * easy to make. Pooling dark and bright readings puts the difference between the
+   * two conditions INTO the correlation, so the statistic rises automatically as the
+   * measured effect grows — it restates the answer instead of testing it. Across
+   * four runs from one person the pooled figure was 0.238, 0.046, 0.802 and 0.877
+   * against reported constrictions of -2.1%, -8.1%, -22.4% and -41.4%: it simply
+   * tracked the effect size. And it passed a 0.5 threshold on data where the eyes,
+   * measured within condition, agreed at r = 0.24.
+   *
+   * Two honest statistics replace it.
+   *
+   * agreementWithin — the correlation between the eyes computed inside each period
+   * and then averaged, so no between-condition difference can inflate it. This is a
+   * real measure of per-reading precision, and the truth it tells is unflattering:
+   * it was 0.159, 0.142, 0.456 and 0.178 across those same four runs. Per-reading
+   * agreement is WEAK however good the averages look. It is reported, not gated,
+   * because it does not discriminate a working run from a broken one.
+   *
+   * overlap — the share of bright-screen readings that are no smaller than the
+   * bottom quarter of the dark-screen readings, i.e. readings that failed to
+   * constrict at all. This is a within-condition comparison of distributions, so a
+   * difference in means cannot manufacture it, and it separated the four runs
+   * cleanly and in order: 57%, 26%, 7%, 5%. This is the gate. */
+  const pearson = (A, B) => {
+    if (A.length < 4) return null;
+    const mA = avg(A), mB = avg(B);
+    let num = 0, dA = 0, dB = 0;
+    for (let i = 0; i < A.length; i++) {
+      num += (A[i] - mA) * (B[i] - mB); dA += (A[i] - mA) ** 2; dB += (B[i] - mB) ** 2;
+    }
+    return dA > 0 && dB > 0 ? num / Math.sqrt(dA * dB) : null;
+  };
+  const readingsIn = (p) => {
+    const from = (p.t0 + SKIP_MS) / 1000, to = p.t1 / 1000;
+    const L = [], R = [], both = [];
+    for (let i = 0; i < t.length; i++) {
+      if (t[i] < from || t[i] > to || bl[i]) continue;
+      if (lft[i] != null && rgt[i] != null) { L.push(lft[i]); R.push(rgt[i]); }
+      if (mm[i] != null) both.push(mm[i]);
+    }
+    return { L, R, both };
+  };
+
+  // Per-reading agreement, within each period only.
+  const withinRs = [];
+  let pairsLR = 0;
+  for (const p of periods) {
+    if (p.kind === "calibration") continue;
+    const { L, R } = readingsIn(p);
+    const r = pearson(L, R);
+    // Only count pairs from periods that actually contributed. Adding L.length
+    // unconditionally printed a denominator that included periods pearson() had
+    // dropped for having under 4 pairs.
+    if (r != null) { withinRs.push(r); pairsLR += L.length; }
+  }
+  const agreementWithin = withinRs.length ? avg(withinRs) : null;
+
+  // The pooled figure, kept ONLY so the confound stays visible and nobody
+  // reintroduces it as a check. Never gated on.
+  let agreementPooled = null;
+  {
+    const L = [], R = [];
+    for (let i = 0; i < t.length; i++) {
+      if (bl[i] || lft[i] == null || rgt[i] == null) continue;
+      L.push(lft[i]); R.push(rgt[i]);
+    }
+    agreementPooled = pearson(L, R);
+  }
+
+  /* Overlap, computed WITHIN each cycle and then averaged — not pooled over the
+     session. Pooling is wrong here because the pupil drifts across 95 seconds as it
+     dark-adapts: in the 26 Aug 2026 run the four dark periods averaged 3.35, 3.65,
+     4.02 and 3.94, a 20% climb. Pooled, that drift lands in the dark distribution's
+     spread and a late bright period gets compared against an early dark one it has
+     no business being compared with, so ordinary adaptation can be scored as
+     overlap. Comparing each bright period against the dark period immediately
+     before it removes drift by construction.
+
+     A NOTE ON READING THE NUMBER, because it is not a percentage of anything
+     obvious. The cut is the 25th percentile of that cycle's dark readings, so if
+     bright and dark were identical distributions the overlap would be about 75%,
+     not 0%. 75% is the null; 15% is the bar. This is a measure of how far the two
+     piles of readings have pulled apart, and it is NOT independent of the size of
+     the effect — see the honest note in the report about what this can and cannot
+     tell you. */
+  const cycleOverlaps = [];
+  let overlap = null, overlapCut = null;
+  {
+    const seq = periods.filter((p) => p.kind !== "calibration");
+    for (let i = 0; i + 1 < seq.length; i++) {
+      if (seq[i].kind !== "dark" || seq[i + 1].kind !== "bright") continue;
+      const dv = readingsIn(seq[i]).both, bv = readingsIn(seq[i + 1]).both;
+      if (dv.length < 6 || bv.length < 6) continue;
+      const sorted = dv.slice().sort((a, b) => a - b);
+      const idx = (sorted.length - 1) * 0.25, lo = Math.floor(idx);
+      const cut = lo + 1 >= sorted.length ? sorted[lo]
+                : sorted[lo] + (sorted[lo + 1] - sorted[lo]) * (idx - lo);
+      cycleOverlaps.push({ cut, frac: bv.filter((v) => v >= cut).length / bv.length,
+                           nDark: dv.length, nBright: bv.length });
+    }
+    if (cycleOverlaps.length) {
+      overlap = avg(cycleOverlaps.map((c) => c.frac));
+      overlapCut = avg(cycleOverlaps.map((c) => c.cut));
+    }
+  }
+
+  // Eye dropout by condition: the non-randomness check.
+  const coverage = (kind) => {
+    const rs = rows.filter((r) => r.kind === kind);
+    const both = rs.reduce((a, r) => a + r.n, 0), all = rs.reduce((a, r) => a + r.n_any, 0);
+    return { both, all, frac: all ? both / all : null };
+  };
+  const covDark = coverage("dark"), covBright = coverage("bright");
+
+  // Per-cycle paired comparison: how often did bright come out smaller than the
+  // dark period beside it? With four cycles this is a sign test, not a p-value.
+  const darkRows = rows.filter((r) => r.kind === "dark");
+  const brightRows = rows.filter((r) => r.kind === "bright");
+  let constricted = 0, pairs = 0;
+  for (let i = 0; i < Math.min(darkRows.length, brightRows.length); i++) {
+    if (darkRows[i].mean != null && brightRows[i].mean != null) {
+      pairs++;
+      if (brightRows[i].mean < darkRows[i].mean) constricted++;
+    }
+  }
+
+  /* ---- IS IT THE PUPIL, OR THE CAMERA? ----
+   * A measured pupil can shrink for reasons that have nothing to do with the pupil, and
+   * two of them happen only on a bright screen:
+   *   1. the webcam turns its own sensitivity down when the screen lights the face. The
+   *      whole eye darkens, the iris moves towards the pupil in brightness, and the
+   *      boundary between them fades. An area-based measurement then reads small.
+   *   2. the screen reflects off the wet front of the eye. Where that lands on the pupil,
+   *      that part is bright rather than dark, is not counted, and the pupil reads small.
+   * Neither is visible in the pupil numbers themselves. Both are visible here.
+   * Note what this can and cannot settle: a difference between conditions shows the
+   * mechanism is PRESENT, not how much of the measured constriction it explains. */
+  const imgDiag = (() => {
+    if (!frameDiag || !frameDiag.length) return null;
+    const g = { dark: [], bright: [] };
+    /* Frames the circle-fit REFUSED, binned separately — this is where reflection damage
+       concentrates, because a reflection crossing the pupil's rim gives the fit
+       contradictory edges and it (correctly) declines. Averaging refused frames in with
+       accepted ones would dilute exactly the signal being looked for. Refused frames
+       with all-zero diagnostics carried no measurable candidate and are skipped. */
+    const bad = { dark: [], bright: [] };
+    for (const p of periods) {
+      if (p.kind === "calibration") continue;
+      const from = (p.t0 + SKIP_MS) / 1000, to = p.t1 / 1000;
+      for (const f of frameDiag) {
+        if (f.t < from || f.t > to) continue;
+        if (f.ok) g[p.kind].push(f);
+        else if (f.exterior > 0 || f.interior > 0) bad[p.kind].push(f);
+      }
+    }
+    if (!g.dark.length || !g.bright.length) return null;
+    const m = (rows, k) => rows.reduce((a, r) => a + r[k], 0) / rows.length;
+    return {
+      n: { dark: g.dark.length, bright: g.bright.length },
+      exterior: { dark: m(g.dark, "exterior"), bright: m(g.bright, "exterior") },
+      contrast: { dark: m(g.dark, "contrast"), bright: m(g.bright, "contrast") },
+      brightInside: { dark: m(g.dark, "brightInside"), bright: m(g.bright, "brightInside") },
+      refused: {
+        n: { dark: bad.dark.length, bright: bad.bright.length },
+        brightInside: {
+          dark: bad.dark.length ? m(bad.dark, "brightInside") : null,
+          bright: bad.bright.length ? m(bad.bright, "brightInside") : null,
+        },
+      },
+    };
+  })();
+
+  /* THE TWO MEASURING METHODS, COMPARED WHERE IT MATTERS. The engine records BOTH
+     diameters for every frame — counting dark dots (area) and fitting the circle's edge —
+     in crop pixels, which convert to pseudo-mm by one shared constant, so percent changes
+     are identical in either unit. Session-wide means existed already; what they could not
+     say is WHERE the methods disagree. The two known bright-screen artefacts (the camera
+     dimming itself, a reflection on the pupil) and a squinting lid all shave the COUNTED
+     pupil without moving its EDGE — the edge fit is synthetically immune to all three. So:
+       agree in dark, disagree on bright  -> something bright-specific is shrinking the
+                                             counted pupil; the edge figure is the better
+                                             estimate of the true change;
+       agree in both                      -> no sign of it; the headline figure stands.
+     Paired frames only (both methods answered on the same crop), so neither mean is
+     built from frames the other never saw. */
+  const methodCmp = (() => {
+    if (!frameDiag || !frameDiag.length) return null;
+    const g = { dark: [], bright: [] };
+    for (const p of periods) {
+      if (p.kind === "calibration") continue;
+      const from = (p.t0 + SKIP_MS) / 1000, to = p.t1 / 1000;
+      for (const f of frameDiag)
+        if (f.t >= from && f.t <= to && f.ok && f.dEdgePx != null && f.dAreaPx > 0) g[p.kind].push(f);
+    }
+    if (g.dark.length < 10 || g.bright.length < 10) return null;
+    const m = (rows, k) => rows.reduce((a, r) => a + r[k], 0) / rows.length;
+    const area = { dark: m(g.dark, "dAreaPx"), bright: m(g.bright, "dAreaPx") };
+    const edge = { dark: m(g.dark, "dEdgePx"), bright: m(g.bright, "dEdgePx") };
+    return {
+      n: { dark: g.dark.length, bright: g.bright.length },
+      area, edge,
+      edge_reads_bigger_pct: {
+        dark: 100 * (edge.dark / area.dark - 1),
+        bright: 100 * (edge.bright / area.bright - 1),
+      },
+      constriction_pct: {
+        area: 100 * (area.bright / area.dark - 1),
+        edge: 100 * (edge.bright / edge.dark - 1),
+      },
+      units: "crop px; paired frames only; percent change identical in pseudo-mm",
+    };
+  })();
+
+  /* WHAT THE REFLECTION REPAIR DID, split by condition. The engine fills the screen's
+     mirror image back into the pupil before measuring (maskrepair.ts); dAreaRawPx keeps
+     the diameter each frame WOULD have had without the fill, so the repair's whole
+     effect is auditable here: how often it fired, how much it filled, and how far it
+     moved the average — per condition, because the mechanism is condition-specific. */
+  const repDiag = (() => {
+    if (!frameDiag || !frameDiag.length) return null;
+    const g = { dark: { frames: 0, repaired: 0, px: 0, dSum: 0, dRawSum: 0 },
+                bright: { frames: 0, repaired: 0, px: 0, dSum: 0, dRawSum: 0 } };
+    for (const p of periods) {
+      if (p.kind === "calibration") continue;
+      const from = (p.t0 + SKIP_MS) / 1000, to = p.t1 / 1000;
+      for (const f of frameDiag) {
+        if (f.t < from || f.t > to || typeof f.dAreaRawPx !== "number") continue;
+        const b = g[p.kind];
+        b.frames++; b.dSum += f.dAreaPx; b.dRawSum += f.dAreaRawPx;
+        if (f.repairPx > 0) { b.repaired++; b.px += f.repairPx; }
+      }
+    }
+    if (!g.dark.frames || !g.bright.frames) return null;
+    const side = (b) => ({
+      frames: b.frames, repaired: b.repaired,
+      typical_px: b.repaired ? Math.round(b.px / b.repaired) : 0,
+      effect_pct: b.dRawSum > 0 ? 100 * (b.dSum / b.dRawSum - 1) : 0,
+    });
+    /* The mistuning detector: what the brightest thing inside the pupil outline
+       actually measured, against the threshold demanded of it. On 27 Aug the first
+       threshold (0.45) sat above the real reflections (~0.38) and the repair fired on
+       zero frames with nothing on screen saying so; these two numbers make that miss
+       visible in one run. */
+    const med = (arr) => { const v = arr.filter((x) => typeof x === "number").sort((a, b) => a - b);
+      return v.length ? v[(v.length - 1) >> 1] : null; };
+    const brightRows = [], cutRows = [];
+    for (const p of periods) {
+      if (p.kind !== "bright") continue;
+      const from = (p.t0 + SKIP_MS) / 1000, to = p.t1 / 1000;
+      for (const f of frameDiag) if (f.t >= from && f.t <= to) { brightRows.push(f.candP95); cutRows.push(f.repairCut); }
+    }
+    return { dark: side(g.dark), bright: side(g.bright),
+             brightest_candidate_bright: med(brightRows), threshold_bright: med(cutRows) };
+  })();
+
+  /* PER-READING PRECISION — and why this REPLACED the "flip counter" (31 Aug 2026).
+     The flip counter flagged same-eye jumps over a fixed 0.8 pseudo-mm bar. Measured
+     across every instrumented run, that bar was the wrong instrument and it told a false
+     story: per-reading scatter is roughly the SAME ABSOLUTE SIZE in both conditions
+     (20:31 run: 0.487 dark against 0.479 bright), while the dark pupil is twice as large
+     — so an absolute bar flags dark 18% against bright 6% and concludes "the dark side
+     flickers", whereas a RELATIVE bar flags dark 8% against bright 12% and concludes the
+     opposite. Same data, opposite finding, chosen by the metric. What is actually true is
+     that precision is constant in absolute terms, so it is worse in PROPORTION on bright
+     screens, where the pupil is small.
+     The genuine two-level flip the counter was built for is gone: the dark distribution
+     had a real second mode ~1.4x above the main one (43 readings at 17:52 and 19:13) and
+     after the veto/reach/cap fixes it collapsed to 8, leaving one smooth peak.
+     So this reports the physically meaningful quantities instead: absolute scatter per
+     condition (the instrument's precision), the same in proportion, the standard error of
+     a period mean (the number that decides whether a study can see its effect), and a
+     RELATIVE flicker bar that a true two-level flip would still trip. */
+  const precDiag = (() => {
+    const mean = (a) => (a.length ? a.reduce((x, y) => x + y, 0) / a.length : null);
+    const out = {};
+    for (const kind of ["dark", "bright"]) {
+      const sds = [], cvs = [], ns = [];
+      for (const p of periods) {
+        if (p.kind !== kind) continue;
+        for (const series of [lft, rgt]) {
+          const vals = [];
+          for (let i = 0; i < t.length; i++) {
+            if (series[i] == null) continue;
+            if (t[i] >= (p.t0 + SKIP_MS) / 1000 && t[i] <= p.t1 / 1000) vals.push(series[i]);
+          }
+          if (vals.length >= 6) {
+            const m = vals.reduce((x, y) => x + y, 0) / vals.length;
+            const s = Math.sqrt(vals.reduce((x, y) => x + (y - m) * (y - m), 0) / (vals.length - 1));
+            sds.push(s); cvs.push((100 * s) / m); ns.push(vals.length);
+          }
+        }
+      }
+      out[kind] = { sd: mean(sds), rel_pct: mean(cvs), readings: mean(ns), eye_periods: sds.length };
+    }
+    // Relative flicker: a genuine two-level flip trips this; ordinary scatter does not.
+    for (const kind of ["dark", "bright"]) {
+      let over = 0, total = 0;
+      for (const series of [lft, rgt]) {
+        let pv = null, pt = null;
+        for (let i = 0; i < t.length; i++) {
+          const x = series[i];
+          if (x == null) { pv = null; continue; }
+          let k = null;
+          for (const p of periods) {
+            if (p.kind === "calibration") continue;
+            if (t[i] >= p.t0 / 1000 + 3.0 && t[i] <= p.t1 / 1000) { k = p.kind; break; }
+          }
+          if (k === kind && pv != null && t[i] - pt < 0.6) {
+            total++;
+            if ((100 * Math.abs(x - pv)) / ((x + pv) / 2) > 25) over++;
+          }
+          pv = x; pt = t[i];
+        }
+      }
+      out[kind].flicker_over_25pct = over;
+      out[kind].steps = total;
+    }
+    out.se_period_mean = (out.dark.sd != null && out.bright.sd != null && out.dark.readings)
+      ? ((out.dark.sd + out.bright.sd) / 2) / Math.sqrt((out.dark.readings + out.bright.readings) / 2)
+      : null;
+    return out;
+  })();
+
+  /* FLOOR PILE-UP CHECK. The size floor is meant to catch garbage (collapsed masks
+     measure ~0.5-0.85), never to trim the real distribution — but the pseudo-mm scale
+     moves between sessions, so a fixed floor CAN drift into the real data. The
+     signature is readings piling up just above the bar: on 27 Aug 2026, 17:52, the
+     floor (then 1.5) had 53% of kept bright readings within 0.25 of it and 88% of the
+     77 discards within 0.2 below it — censoring, which biases the bright mean up and
+     understates the constriction. This check makes that visible every run. */
+  const floorPile = (() => {
+    const floor = (cal.pupil_mm_bounds || [])[0];
+    if (floor == null) return null;
+    const BAND = 0.25;
+    const g = { dark: { near: 0, all: 0 }, bright: { near: 0, all: 0 } };
+    for (const p of periods) {
+      if (p.kind === "calibration") continue;
+      const from = (p.t0 + SKIP_MS) / 1000, to = p.t1 / 1000;
+      for (let i = 0; i < t.length; i++) {
+        if (t[i] < from || t[i] > to) continue;
+        for (const x of [lft[i], rgt[i]]) if (x != null) {
+          g[p.kind].all++;
+          if (x <= floor + BAND) g[p.kind].near++;
+        }
+      }
+    }
+    const frac = (b) => (b.all ? b.near / b.all : null);
+    return { floor, band: BAND, dark: frac(g.dark), bright: frac(g.bright),
+             n_dark: g.dark.all, n_bright: g.bright.all };
+  })();
+
+  /* THROWN-AWAY READINGS, split by condition. The session totals cannot tell "a bit noisy
+     everywhere" from "breaks down on bright screens", and only the second biases the
+     result: a condition that loses its most extreme readings has its mean pulled towards
+     the middle. `too_small` is the one that matters here — a pupil measuring below the
+     physiological floor is a measurement failure, and BOTH known bright-screen artefacts
+     fail in that direction, so they would show up as too-small rejections clustered on
+     bright screens. Note the direction of the bias if they do: throwing out the readings
+     that came out too small makes the bright average LARGER, so it makes the measured
+     constriction look SMALLER, not bigger. */
+  const rejDiag = (() => {
+    const empty = { total: 0, outside: 0, dark: {}, bright: {}, n: { dark: 0, bright: 0 },
+                    median_value: { dark: {}, bright: {} }, median_bright: { dark: {}, bright: {} } };
+    if (!rejects || !rejects.length) return empty;
+    const g = { dark: {}, bright: {} }, n = { dark: 0, bright: 0 };
+    const vals = { dark: {}, bright: {} }, brights = { dark: {}, bright: {} };
+    let outside = 0;
+    for (const e of rejects) {
+      let where = null;
+      for (const p of periods) {
+        if (p.kind === "calibration") continue;
+        if (e.t >= (p.t0 + SKIP_MS) / 1000 && e.t <= p.t1 / 1000) { where = p.kind; break; }
+      }
+      if (!where) { outside++; continue; }
+      g[where][e.reason] = (g[where][e.reason] || 0) + 1;
+      if (typeof e.value === "number") (vals[where][e.reason] = vals[where][e.reason] || []).push(e.value);
+      if (typeof e.bright === "number") (brights[where][e.reason] = brights[where][e.reason] || []).push(e.bright);
+      n[where]++;
+    }
+    const med = (a) => { if (!a || !a.length) return null;
+      const v = a.slice().sort((x, y) => x - y); return v[(v.length - 1) >> 1]; };
+    const medAll = (o) => { const out = {}; for (const k in o) out[k] = med(o[k]); return out; };
+    return { total: rejects.length, outside, dark: g.dark, bright: g.bright, n,
+             median_value: { dark: medAll(vals.dark), bright: medAll(vals.bright) },
+             median_bright: { dark: medAll(brights.dark), bright: medAll(brights.bright) } };
+  })();
+
+  /* The gate: how much the two conditions still overlap. A run that reports a tidy
+     average difference while half its bright readings never constricted is not
+     measuring the reflex, and the averages alone cannot tell you that.
+
+     15% is a judgement, calibrated on four runs from ONE person, where the values
+     were 57%, 26%, 7% and 5% — so the threshold sits in the gap between the two
+     runs we know were broken and the two we believe. It is not a validated
+     cut-off, and with one participant it cannot be. Treat it as a tripwire. */
+  /* RECALIBRATED when the statistic changed from pooled to per-cycle. The old bar of
+     15% was measured on the pooled figure; per-cycle values are systematically larger
+     (drift no longer pads the dark spread), so keeping 15% would have paired a new
+     statistic with an old threshold. Across five sessions from one person the per-cycle
+     means are 39%, 17%, 15%, 6% and 1%; the two lowest are the runs with every fix in
+     place and the two highest are runs with known measurement faults. 12% sits in the
+     gap. Remember the null value is about 75%, not 0%, so this is a demanding bar by
+     design: the light reflex should be far larger than any effect a study is chasing,
+     which makes it a floor on measurement quality rather than on the study's effect.
+     One participant. It is a tripwire, not a validated cut-off. */
+  const OVERLAP_MAX = 0.12;
+  const separates = overlap != null && overlap <= OVERLAP_MAX;
+
+  /* Data sufficiency, reported separately from validity. A run can establish the
+     DIRECTION of the reflex convincingly and still rest its bright-screen average
+     on a handful of readings, because eyes are lost when the pupil is small. On
+     the 25 Aug 2026 run: 96% of dark readings had both eyes against 29% of bright
+     ones, leaving as few as 3 readings in a bright period — a standard error near
+     20% of the pupil size. That does not make the direction wrong; it does mean
+     the SIZE is poorly pinned down, and it must be said out loud rather than left
+     for someone to notice in the per-period table. */
+  const COVERAGE_MIN = 0.5;
+  const thinSide = covBright.frac != null && covBright.frac < COVERAGE_MIN ? "bright"
+                 : covDark.frac != null && covDark.frac < COVERAGE_MIN ? "dark" : null;
+  const thinnest = Math.min.apply(null, rows.filter((r) => r.kind !== "calibration").map((r) => r.n));
+
+  let cls = "bad", verdict;
+  if (pct == null) {
+    verdict = "No verdict: not enough pupil samples to compare. " + (cal.reason || "");
+  } else if (pct <= -5 && constricted === pairs && pairs >= 3 && !separates) {
+    cls = "weak";
+    verdict = "Do not trust this number. The averages moved the right way (" + Math.abs(pct).toFixed(1) +
+      "% smaller on bright screens, in " + constricted + " of " + pairs + " cycles), but " +
+      (overlap == null ? "there were too few readings to compare the two conditions properly"
+        : Math.round(overlap * 100) + "% of your bright-screen readings were no smaller than the " +
+          "smaller quarter of your dark-screen readings — they did not constrict at all") +
+      ". An average can move for reasons that have nothing to do with your pupil, so a difference in " +
+      "averages sitting on top of two overlapping piles of readings is a warning rather than a result. " +
+      "Better light on your face is the usual fix.";
+  } else if (pct <= -5 && constricted === pairs && pairs >= 3) {
+    cls = "good";
+    verdict = "The reflex is visible. The pupil measured " + Math.abs(pct).toFixed(1) +
+      "% smaller on bright screens than dark ones, that held in every one of the " + pairs +
+      " cycles, and the two conditions barely overlap — only " + Math.round(overlap * 100) +
+      "% of bright readings failed to constrict. This channel is detecting a real physiological " +
+      "change, so it can be trusted for effects of comparable size. Two limits, both real: " +
+      "individual readings are still noisy (see the agreement figure below), and the SIZE of the " +
+      "change belongs to your screen, room and face — do not carry the percentage to another setup.";
+  } else if (!separates && pct <= -2) {
+    /* Ordering matters here, and it was wrong. The separation check used to sit only
+       inside the "every cycle constricted" branch, so a run with 60% overlap and a
+       modest average difference fell through to the branch below and was described as
+       a real but small reflex. Separation is now consulted first. */
+    cls = "bad";
+    verdict = "Not usable, despite the averages pointing the right way (" +
+      Math.abs(pct).toFixed(1) + "%). " +
+      (overlap == null ? "There were too few readings per cycle to compare the two conditions."
+        : Math.round(overlap * 100) + "% of bright-screen readings were as large as the smaller " +
+          "quarter of the dark readings in the same cycle — the two piles of readings have barely " +
+          "separated, so the difference in averages is not telling you about your pupil.") +
+      " Better light on your face is the usual fix.";
+  } else if (pct <= -2) {
+    cls = "weak";
+    verdict = "A constriction in the right direction, but small: " + Math.abs(pct).toFixed(1) +
+      "% (" + constricted + " of " + pairs + " cycles). The light reflex should be far larger than " +
+      "any psychological effect you plan to study, so a weak result here means this setup is not " +
+      "sensitive enough to trust for subtler effects. Try brighter/darker screens, a darker room, " +
+      "better face lighting, or sitting closer.";
+  } else if (pct > 2) {
+    verdict = "The pupil measured LARGER on bright screens (" + pct.toFixed(1) + "%), which is the " +
+      "opposite of physiology. That means the number is tracking something about the image — face " +
+      "illumination changing with the screen, most likely — rather than your pupil. Do not use this " +
+      "channel for this setup.";
+  } else {
+    verdict = "No detectable difference between dark and bright (" + pct.toFixed(1) + "%). The " +
+      "strongest, most reliable pupil signal there is did not show up, so subtler effects will not " +
+      "either. Check the calibration line below before concluding it is the method: poor lighting or " +
+      "a failed calibration would produce this too.";
+  }
+
+  /* Every calibration value below goes through v(). A field that is missing —
+     because the session predates it, or the engine never populated it — must render
+     as a dash, never as the word "undefined" in a report someone is reading to
+     decide whether to trust their data. Replaying four older sessions through this
+     report leaked five "undefined"s before this was added. */
+  const v = (x, suffix) => (x == null ? "\u2014" : x + (suffix || ""));
+
+  $("report").style.display = "block";
+  $("report").innerHTML = `
+    <div class="panel">
+      <h1>Result</h1>
+      <div class="verdict ${cls}">${verdict}</div>
+      ${thinSide ? `<div class="verdict weak">Thin data on one side. Only
+        ${Math.round((thinSide === "bright" ? covBright.frac : covDark.frac) * 100)}% of your
+        ${thinSide}-screen readings had both eyes, and the sparsest period rests on just
+        ${thinnest} readings. One eye is lost most often when the pupil is small, so this is
+        expected rather than broken — but it means the <b>size</b> of the change above is poorly
+        pinned down even if the direction is clear. Better light on your face is the fix; more
+        cycles would also help.</div>` : ""}
+
+      <h2>The comparison</h2>
+      <table>
+        <tr><th>Dark screens, mean pupil</th><td>${dark == null ? "—" : dark.toFixed(3) + " pseudo-mm"}</td></tr>
+        <tr><th>Bright screens, mean pupil</th><td>${bright == null ? "—" : bright.toFixed(3) + " pseudo-mm"}</td></tr>
+        <tr><th>Change</th><td><b>${pct == null ? "—" : pct.toFixed(1) + "%"}</b></td></tr>
+        <tr><th>Cycles where bright &lt; dark</th><td>${constricted} of ${pairs}</td></tr>
+      </table>
+
+      <h2>How far apart are the two conditions?</h2>
+      <p style="font-size:13px">Each bright period is compared against the dark period immediately
+      before it, so the pupil's slow drift over the session cannot count as overlap. The cut is the
+      smaller quarter of that cycle's dark readings. <b>If bright and dark were identical, this would
+      read about 75%, not 0%</b> — 75% is the "no effect at all" value, and under
+      ${Math.round(OVERLAP_MAX * 100)}% is the bar.</p>
+      <table>
+        <tr><th>Bright readings that never constricted</th><td><b>${overlap == null ? "too few readings"
+          : Math.round(overlap * 100) + "%"}</b>${cycleOverlaps.length
+          ? " — per cycle: " + cycleOverlaps.map((c) => Math.round(c.frac * 100) + "%").join(", ") +
+            " (from " + cycleOverlaps.map((c) => c.nBright).join("/") + " bright readings)"
+          : ""} — under ${Math.round(OVERLAP_MAX * 100)}% is the bar, 75% is no effect</td></tr>
+        <tr><th>Cycles this is based on</th><td>${cycleOverlaps.length} of ${CYCLES}${
+          cycleOverlaps.length < CYCLES
+            ? " — the rest had too few readings to compare, so this figure rests on less than the whole session"
+            : ""}</td></tr>
+        <tr><th>Iris size in the picture</th><td>${cal.iris_source_px_mean == null ? "—"
+          : cal.iris_source_px_mean + " px" + (cal.iris_source_px_mean < 20
+            ? " <b>&larr; too far from the camera; nothing below is trustworthy</b>"
+            : cal.iris_source_px_mean < 25 ? " (marginal — sit closer if possible)" : " (good)")}</td></tr>
+        <tr><th>Both eyes measured, dark screens</th><td>${covDark.frac == null ? "—"
+          : Math.round(covDark.frac * 100) + "% (" + covDark.both + " of " + covDark.all + ")"}</td></tr>
+        <tr><th>Both eyes measured, bright screens</th><td>${covBright.frac == null ? "—"
+          : Math.round(covBright.frac * 100) + "% (" + covBright.both + " of " + covBright.all + ")"}</td></tr>
+      </table>
+      <h2>Is it your pupil, or the camera?</h2>
+      <p style="font-size:13px"><b>Camera brightness lock:</b> ${!exposureLock || !exposureLock.attempted
+        ? "not attempted this run."
+        : exposureLock.applied
+          ? "<b>locked</b> — " + exposureLock.note + ". The camera could not dim itself, so any"
+            + " constriction below is not the camera compensating."
+          : exposureLock.note + ". The camera stayed in charge of its own brightness,"
+            + " so the table below is the check on whether it interfered."}</p>
+      ${imgDiag ? `
+      <p style="font-size:13px">Two things can make a pupil <i>measure</i> smaller on a bright
+      screen without it actually being smaller. The webcam turns its own sensitivity down when the
+      screen lights your face, which darkens your whole eye and fades the line between pupil and
+      iris. And the white screen reflects off the wet front of your eye; where that reflection lands
+      on the pupil, that part looks bright instead of black and does not get counted. Neither shows
+      up in the pupil numbers. Both show up here.</p>
+      <table>
+        <tr><th></th><th>Dark screens</th><th>Bright screens</th><th>What it means</th></tr>
+        <tr><th>How bright your iris looks</th>
+          <td>${imgDiag.exterior.dark.toFixed(3)}</td><td>${imgDiag.exterior.bright.toFixed(3)}</td>
+          <td>${imgDiag.exterior.bright < imgDiag.exterior.dark * 0.9
+            ? "<b>Your eye looks DARKER on bright screens</b> — that is the camera turning itself down."
+            : "The camera is not dimming your eye much."}</td></tr>
+        <tr><th>How clearly the pupil edge stands out</th>
+          <td>${imgDiag.contrast.dark.toFixed(3)}</td><td>${imgDiag.contrast.bright.toFixed(3)}</td>
+          <td>${imgDiag.contrast.bright < imgDiag.contrast.dark * 0.8
+            ? "<b>Much fainter on bright screens</b> — this is how the dimming would shrink the number."
+            : "Similar in both, so the edge is not being lost."}</td></tr>
+        <tr><th>Screen reflected onto your pupil</th>
+          <td>${Math.round(imgDiag.brightInside.dark * 100)}%</td>
+          <td>${Math.round(imgDiag.brightInside.bright * 100)}%</td>
+          <td>${imgDiag.brightInside.bright > imgDiag.brightInside.dark + 0.05
+            ? "<b>A reflection is sitting on your pupil on bright screens.</b>"
+            : "No meaningful reflection on the pupil."}</td></tr>
+      </table>
+      <p style="font-size:13px">From ${imgDiag.n.dark} dark and ${imgDiag.n.bright} bright frames.
+      A difference here shows the effect is <i>present</i>; it does not say how much of the
+      constriction above it explains.</p>
+      ${repDiag && (repDiag.dark.repaired + repDiag.bright.repaired) > 0 ? `
+      <p style="font-size:13px"><b>Putting the reflection back:</b> where the screen's mirror
+      image bit into the pupil, the bright pixels inside the pupil's own outline were filled
+      back in before measuring. Bright screens: ${repDiag.bright.repaired} of
+      ${repDiag.bright.frames} frames repaired (typical ${repDiag.bright.typical_px} pixels),
+      raising the measured bright diameter by ${repDiag.bright.effect_pct.toFixed(1)}%.
+      Dark screens: ${repDiag.dark.repaired} of ${repDiag.dark.frames}
+      (${repDiag.dark.effect_pct.toFixed(1)}%). A repair that fires mostly on bright screens is
+      the reflection mechanism itself; the raised bright average makes the measured
+      constriction <i>smaller</i> and closer to the truth. <span style="opacity:.7">(?norepair=1
+      runs without it.)</span></p>` : repDiag ? `
+      <p style="font-size:13px"><b>Putting the reflection back:</b> nothing was filled this
+      run. ${repDiag.brightest_candidate_bright != null && repDiag.threshold_bright != null
+        ? `The brightest thing found inside the pupil outline on bright screens measured
+           <b>${repDiag.brightest_candidate_bright.toFixed(2)}</b> against a fill threshold of
+           <b>${repDiag.threshold_bright.toFixed(2)}</b> — ${
+             repDiag.brightest_candidate_bright >= repDiag.threshold_bright
+             ? "at or above the threshold, so the outline simply had no reflection bites to fill."
+             : repDiag.brightest_candidate_bright >= repDiag.threshold_bright - 0.10
+             ? "<b>just below the threshold.</b> If reflections are visibly sitting on the pupil (as on a phone video), the threshold is set too high for this camera and the repair is missing them."
+             : "well below the threshold — there was nothing reflection-like inside the outline."}`
+        : ""}</p>` : ""}
+      ${imgDiag.refused && (imgDiag.refused.n.dark + imgDiag.refused.n.bright) > 0 ? `
+      <p style="font-size:13px"><b>Frames the circle-fit refused to measure</b> (damage
+      concentrates here): ${imgDiag.refused.n.dark} dark, ${imgDiag.refused.n.bright} bright.
+      Reflection sitting on the pupil in those frames: dark ${imgDiag.refused.brightInside.dark == null
+        ? "—" : Math.round(imgDiag.refused.brightInside.dark * 100) + "%"}, bright ${
+        imgDiag.refused.brightInside.bright == null
+        ? "—" : Math.round(imgDiag.refused.brightInside.bright * 100) + "%"}.
+      ${imgDiag.refused.brightInside.bright != null && imgDiag.refused.brightInside.bright > imgDiag.brightInside.bright + 0.05
+        ? "<b>The refused bright frames carry much more reflection than the measured ones — the screen's reflection is what those refusals are protecting you from.</b>"
+        : ""}</p>` : ""}` : `<p style="font-size:13px">Not recorded for this
+      session.</p>`}
+
+      <h2>The same pupil, measured two ways</h2>
+      ${methodCmp ? (() => {
+        const d = methodCmp.edge_reads_bigger_pct, c = methodCmp.constriction_pct;
+        const gap = d.bright - d.dark;
+        const fmt = (x, dp = 1) => (x >= 0 ? "+" : "") + x.toFixed(dp);
+        return `
+      <p style="font-size:13px">Every frame is measured twice: by counting the dark dots the
+      model marked as pupil, and by fitting a circle to where the image actually changes from
+      dark to light. The camera problems above — and a squinting eyelid — all shave the
+      <i>counted</i> pupil without moving its <i>edge</i>. So if the two methods agree on dark
+      screens but split apart on bright ones, something bright-specific is shrinking the count,
+      and the edge figure is closer to the truth.</p>
+      <table>
+        <tr><th></th><th>Dark screens</th><th>Bright screens</th></tr>
+        <tr><th>Counting dark dots (mask area)</th>
+          <td>${methodCmp.area.dark.toFixed(2)}</td><td>${methodCmp.area.bright.toFixed(2)}</td></tr>
+        <tr><th>Fitting the circle's edge (current default)</th>
+          <td>${methodCmp.edge.dark.toFixed(2)}</td><td>${methodCmp.edge.bright.toFixed(2)}</td></tr>
+        <tr><th>Edge reads bigger by</th>
+          <td>${fmt(d.dark)}%</td><td>${fmt(d.bright)}%${gap > 4 ? " <b>&larr; the split</b>" : ""}</td></tr>
+      </table>
+      <p><b>Constriction, measured each way:</b> counting ${fmt(c.area)}%, edge ${fmt(c.edge)}%.</p>
+      <p style="font-size:13.5px">${gap > 4
+        ? "<b>The methods split apart on bright screens specifically</b> (" + fmt(d.dark)
+          + "% dark vs " + fmt(d.bright) + "% bright). Something bright-specific is shaving the"
+          + " counted pupil without moving its edge — a fainter boundary, a reflection, or a lid."
+          + " The edge figure (" + fmt(c.edge) + "%) is the better estimate of your true change."
+        : gap < -4
+        ? "<b>They disagree more on DARK screens</b>, which none of the known camera problems"
+          + " predicts. Treat both figures with caution and flag this run."
+        : "<b>They agree in both conditions</b> (within " + fmt(Math.max(Math.abs(d.dark), Math.abs(d.bright)))
+          + "%), so there is no sign the counting method is being shrunk on bright screens."
+          + " The headline figure stands."}
+      From ${methodCmp.n.dark} dark and ${methodCmp.n.bright} bright paired frames (units:
+      pixels of the eye crop; percent change is identical in pseudo-millimetres).</p>`;
+      })() : `<p style="font-size:13px">Too few frames where both methods answered — not
+      comparable this run.</p>`}
+
+      <h2>Readings thrown away, and on which screen</h2>
+      <p style="font-size:13px">A reading is dropped if it says your pupil is an impossible size,
+      if it changes faster than a pupil can, or if your two eyes disagree wildly. What matters is
+      not how many, but <i>whether they pile up on one screen colour</i>. If a screen colour loses
+      its most extreme readings, its average is dragged towards the middle. Note the direction:
+      dropping readings that came out <i>too small</i> makes the bright average larger, so it makes
+      the measured constriction look <b>smaller</b> than it is, not bigger.</p>
+      <table>
+        <tr><th>Reason</th><th>Dark screens</th><th>Bright screens</th></tr>
+        ${["too_small", "too_large", "too_fast", "eyes_disagree"].map((k) => {
+          const d = rejDiag.dark[k] || 0, b = rejDiag.bright[k] || 0;
+          const label = { too_small: "Impossibly small pupil", too_large: "Impossibly large pupil",
+                          too_fast: "Changed faster than a pupil can", eyes_disagree: "The two eyes disagreed" }[k];
+          const mv = (rejDiag.median_value || {});
+          const cell = (side, count) => {
+            const m = (mv[side] || {})[k];
+            return `${count}${count > 0 && m != null ? ` <span style="opacity:.75">(typical ${m.toFixed(2)})</span>` : ""}`;
+          };
+          const lop = (d + b) >= 4 && (b > d * 3 || d > b * 3);
+          return `<tr><th>${label}</th><td>${cell("dark", d)}</td><td>${cell("bright", b)}${lop && b > d
+            ? " <b>&larr; almost all on bright screens</b>" : ""}</td></tr>`;
+        }).join("")}
+        <tr><th>Total inside a measured period</th><td>${rejDiag.n.dark}</td><td>${rejDiag.n.bright}</td></tr>
+      </table>
+      ${(() => {
+        /* Were the discarded too-small readings REAL small pupils (the floor censoring a
+           true tail, which biases the bright mean up) or REFLECTION-DAMAGED ones (a bright
+           patch eating part of a constricted pupil, which the floor rightly refuses)?
+           Decided by the reflection measured on those same frames, against the reflection
+           on the frames that were kept. Seen directly in a participant's own phone video
+           (27 Aug 2026): the reflection stays the same size while the pupil constricts
+           down to it, so on bright screens it swallows most of what is left. */
+        const rejBright = ((rejDiag.median_bright || {}).bright || {}).too_small;
+        const keptBright = imgDiag ? imgDiag.brightInside.bright : null;
+        /* BLIND SPOT, found on the 17:16 run: the reflection measurement is taken inside
+           the FITTED circle, and when a reflection eats the rim, the fit hugs the dark
+           remnant — so the discarded readings' own reflection number reads 0% exactly
+           when the damage is worst. The refused-fit frames (where no circle satisfied
+           the gates) do not have that blind spot, so they are consulted too. */
+        const refusedBright = imgDiag && imgDiag.refused ? imgDiag.refused.brightInside.bright : null;
+        const nB = rejDiag.bright.too_small || 0;
+        if (nB < 3 || (rejBright == null && refusedBright == null)) return "";
+        const direct = rejBright != null && keptBright != null && rejBright > keptBright + 0.05;
+        const indirect = refusedBright != null && keptBright != null && refusedBright > keptBright + 0.05;
+        return `<p style="font-size:13px"><b>Were the discarded bright readings real?</b>
+        Reflection measured on them at the moment of discarding: ${rejBright == null ? "—"
+          : Math.round(rejBright * 100) + "%"}; on the frames the circle-fit refused outright:
+        ${refusedBright == null ? "—" : Math.round(refusedBright * 100) + "%"}; on the readings
+        that were kept: ${keptBright == null ? "—" : Math.round(keptBright * 100) + "%"}.
+        ${direct || indirect
+          ? "<b>The evidence points to reflection damage</b>" + (direct
+            ? " — the discarded readings themselves carry the reflection."
+            : " — the discarded readings read clean, but that number has a blind spot (when a reflection eats the rim, the measurement circle hugs the dark remnant and reads 0%), and the refused-fit frames, which do not have the blind spot, carry clearly more reflection than kept frames. Refusing these readings was correct; they are not evidence of a smaller pupil.")
+          : "Neither the discarded readings nor the refused-fit frames carry more reflection than the kept ones — so the size floor may be cutting a real tail of your distribution, and the bright average would then be biased up. Worth re-checking the floor."}</p>`;
+      })()}
+      ${floorPile && floorPile.bright != null ? `
+      <p style="font-size:13px"><b>Floor check:</b> readings sitting within ${floorPile.band} of the
+      smallest allowed size (${floorPile.floor}): dark ${Math.round(100 * floorPile.dark)}%,
+      bright ${Math.round(100 * floorPile.bright)}%. ${floorPile.bright > 0.25
+        ? "<b>The bright readings pile up against the floor</b> — the floor is cutting into the real distribution, the bright average is biased up, and the constriction is understated. The floor needs lowering."
+        : "No pile-up: the floor is below the real distribution, catching only garbage."}</p>` : ""}
+      <p style="font-size:13px">${rejDiag.total === 0 ? "Nothing was thrown away."
+        : (rejDiag.outside || 0) + " more fell in the calibration screen or the discarded first "
+          + (SKIP_MS / 1000) + "s of a period and are not counted above."}</p>
+
+      <h2>How precise is one reading?</h2>
+      ${precDiag.dark.sd != null && precDiag.bright.sd != null ? `
+      <p style="font-size:13px">Scatter of individual readings <i>within</i> a steady period —
+      the pupil is not changing, so this is the instrument's own precision.</p>
+      <table>
+        <tr><th></th><th>Dark screens</th><th>Bright screens</th></tr>
+        <tr><th>Scatter, in pseudo-mm</th>
+          <td>&plusmn;${precDiag.dark.sd.toFixed(3)}</td>
+          <td>&plusmn;${precDiag.bright.sd.toFixed(3)}</td></tr>
+        <tr><th>The same, as a share of pupil size</th>
+          <td>${precDiag.dark.rel_pct.toFixed(1)}%</td>
+          <td>${precDiag.bright.rel_pct.toFixed(1)}%</td></tr>
+        <tr><th>Readings jumping more than 25% between frames</th>
+          <td>${precDiag.dark.flicker_over_25pct} of ${precDiag.dark.steps}</td>
+          <td>${precDiag.bright.flicker_over_25pct} of ${precDiag.bright.steps}</td></tr>
+      </table>
+      <p style="font-size:13px">${Math.abs(precDiag.dark.sd - precDiag.bright.sd) < 0.15
+        ? "<b>Precision is the same absolute size in both conditions</b> — so it is worse in <i>proportion</i> on bright screens, simply because the pupil is smaller there. That is the expected behaviour of this measurement, not a fault."
+        : precDiag.bright.sd > precDiag.dark.sd
+        ? "<b>Bright screens are noisier even in absolute terms</b> — something condition-specific is degrading the measurement; check the camera and reflection table above."
+        : "<b>Dark screens are noisier in absolute terms</b>, which is unusual — worth checking whether the fit is escaping beyond the pupil rim on dilated frames."}
+      ${precDiag.se_period_mean != null ? `<b>A period average of about
+      ${Math.round((precDiag.dark.readings + precDiag.bright.readings) / 2)} readings is therefore
+      precise to roughly &plusmn;${precDiag.se_period_mean.toFixed(2)} pseudo-mm.</b> That is the
+      figure to compare against any effect you hope to measure: the light reflex moves the pupil
+      by whole pseudo-millimetres, so it is far above this floor, but a subtler effect may not be.` : ""}</p>
+      ` : `<p style="font-size:13px">Too few readings per period to estimate precision.</p>`}
+
+      <h2>Agreement between your eyes</h2>
+      <p style="font-size:13px">Your two pupils are physiologically linked, so if each reading were
+      precise, the two eyes would agree closely. Measured <i>inside</i> each period, so that the
+      dark-versus-bright difference cannot inflate it:</p>
+      <table>
+        <tr><th>Agreement between your eyes, per reading</th><td><b>${agreementWithin == null
+          ? "too few paired readings" : agreementWithin.toFixed(3)}</b>
+          (from ${pairsLR} readings with both eyes, averaged across periods)</td></tr>
+        <tr><th>The same figure pooled across conditions</th><td>${agreementPooled == null ? "—"
+          : agreementPooled.toFixed(3)} — <b>not a validity check.</b> Pooling puts the
+          dark-versus-bright difference inside the correlation, so this number climbs on its own as
+          the effect grows. An earlier version of this test used it as the check and was wrong;
+          it is shown only so the difference between the two is visible. It is also computed on a
+          slightly larger sample than the within-period figure, which uses only periods with at
+          least four paired readings — so the two are not exactly like-for-like.</td></tr>
+      </table>
+      <p style="font-size:13px">Per-reading agreement has been weak in every run measured so far
+      (0.14 to 0.46). That is a statement about <i>single</i> readings, not about the averages: the
+      period averages above each rest on many readings, which is why the reflex still shows. It does
+      mean small effects need many trials.</p>
+      <p style="font-size:13px">If the bright row is much lower than the dark row, eyes are being
+      lost precisely when the pupil is small — so allowing single-eye readings would bias this
+      comparison rather than merely add noise. That is why the figures above use readings with
+      both eyes only. The single-eye version is below, for comparison, not for reporting.</p>
+      <div class="verdict weak" style="font-size:13px"><b>What no number on this page can settle.</b>
+      The screen lights your face as well as your eye, so anything that moves with screen brightness
+      — your pupil, or the image the model is looking at — produces the same pattern here. The
+      overlap figure above measures how far the two conditions have pulled apart; it does not, and
+      cannot, prove the cause is your pupil rather than the picture. Three earlier versions of this
+      test each claimed one statistic settled the question and each was wrong. What genuinely
+      supports a physiological reading is the pattern ACROSS cycles: a pupil dark-adapts, so dark
+      periods should creep larger and bright periods smaller as the session goes on. Look at the
+      per-period table below for that trend. A lighting artefact has no reason to drift in two
+      opposite directions at once.</div>
+      <table>
+        <tr><th>Change, single eye allowed</th><td>${pctAny == null ? "—" : pctAny.toFixed(1) + "%"}
+          (dark ${darkAny == null ? "—" : darkAny.toFixed(3)},
+           bright ${brightAny == null ? "—" : brightAny.toFixed(3)})</td></tr>
+      </table>
+
+      <h2>Every period</h2>
+      <table>
+        <tr><th>Period</th><th>Mean pupil<br>(both eyes)</th><th>Readings<br>used</th>
+          <th>Dropped:<br>one eye only</th><th>Blinks<br>dropped</th>
+          <th>Mean if one<br>eye allowed</th></tr>
+        ${rows.map((r) => `<tr><td>${r.kind}</td><td>${r.mean == null ? "—" : r.mean.toFixed(3)}</td>
+          <td>${r.n}</td><td>${r.one_eye}</td><td>${r.blinks}</td>
+          <td>${r.mean_any == null ? "—" : r.mean_any.toFixed(3)}</td></tr>`).join("")}
+      </table>
+
+      <h2>Was the measurement healthy?</h2>
+      <table>
+        <tr><th>Calibration</th><td>${v(cal.status)} — ${cal.reason || ""}</td></tr>
+        <tr><th>Threshold / stability</th><td>${v(cal.threshold)} / ${v(cal.stability)}</td></tr>
+        <tr><th>Frames judged blinks</th><td>${v(cal.frames_rejected_blink)} of ${v(cal.frames_seen)}</td></tr>
+        <tr><th>Masks rejected on shape</th><td>${v(cal.masks_rejected_shape)} of ${v(cal.masks_measured)}
+          (mean ratio ${v(cal.mask_aspect_mean)}, fill ${v(cal.mask_fill_mean)})</td></tr>
+        <tr><th>Mask cleaning</th><td>${v(cal.mask_blobs_discarded)} stray blobs discarded,
+          ${v(cal.mask_hole_pixels_filled)} reflection-hole pixels filled back in</td></tr>
+        <tr><th>Which blob was the pupil</th><td>${cal.blob_select == null
+          ? "\u2014 (this session predates the record)"
+          : cal.blob_select === "center"
+            ? "nearest the centre of the crop (" + v(cal.mask_blobs_recentred) +
+              " eye-measurements where that was NOT the biggest dark region)"
+            : "the biggest dark region"}</td></tr>
+        <tr><th>Eyelid across the pupil</th><td>${v(cal.masks_wide_kept)} <b>eye-measurements</b>
+          (each reading has two, one per eye) were wide enough that the old shape limit would have
+          thrown them away. A bright screen makes people squint, and a squint leaves a wide, short
+          pupil, so these are measurements recovered rather than a fault${cal.masks_wide_kept === 0
+          ? " — and a count of zero means you were not squinting, so that recovery did not apply to you"
+          : ""}.</td></tr>
+        <tr><th>How the size was measured</th><td>${cal.diameter_source == null
+          ? "\u2014 (this session predates the record) " : "from the mask's " +
+            (cal.diameter_source === "width" ? "<b>width</b>, which an eyelid cannot shorten" : "area")}
+          (mean width ${v(cal.mean_diameter_crop_px_width)} px; the old area-based rule would have said
+          ${v(cal.mean_diameter_crop_px_area)} px)</td></tr>
+        <tr><th>Lash or lid merged into the pupil</th><td>${cal.masks_row_trimmed == null
+          ? "\u2014 (this session predates the check)"
+          : cal.masks_row_trimmed === 0
+            ? "none — no eye-measurement had a dark band merged into the pupil"
+            : v(cal.masks_row_trimmed) + " <b>eye-measurements</b> had rows excluded as too wide to be " +
+              "pupil, i.e. a lash line or lid margin touching it. Excluding them is what stops the band " +
+              "becoming the measured size; a high count means contamination was common, not that the " +
+              "readings are bad."}</td></tr>
+        ${cal.diameter_source === "width" ? `<tr><th>No pupil shape could be fitted</th><td>${
+          v(cal.fit_failed)} eye-measurements. The size is found by fitting a circle to the dark patch;
+          when no circle explains it, the fit declines to guess and the reading is lost rather than
+          wrong.</td></tr>` : ""}
+        <tr><th>Refused: changed too fast to be a pupil</th><td>${cal.readings_rejected_too_fast == null
+          ? "\u2014 (this session predates the check)"
+          : v(cal.readings_rejected_too_fast) + " eye-measurements. A pupil has a speed limit " +
+            "(limits here: " + (cal.rate_limits_mm_per_sec ? cal.rate_limits_mm_per_sec.join(" mm/s dilating, ") +
+            " mm/s constricting" : "\u2014") + "), and a lid crossing the pupil changes the MEASUREMENT far " +
+            "faster than that. This uses time rather than shape, so it catches contamination no shape rule " +
+            "could." + (cal.rate_reanchors ? " Re-anchored " + cal.rate_reanchors + " times after a run of " +
+            "rejections, which stops one bad reading silencing the channel." : "")}</td></tr>
+        <tr><th>Refused: the two eyes disagreed</th><td>${cal.readings_rejected_eyes_disagree == null
+          ? "\u2014 (this session predates the check)"
+          : v(cal.readings_rejected_eyes_disagree) + " readings, judged against YOUR own usual difference " +
+            "between the eyes (" + v(cal.eye_difference_baseline) + " pseudo-mm), not against zero — so a " +
+            "steady difference is learned rather than thrown away. Both eyes go when they disagree, because " +
+            "which one is wrong cannot be known."}</td></tr>
+        <tr><th>Edge fit, measured alongside</th><td>${cal.edge_fit_ok_fraction == null
+          ? "\u2014 (this session predates it)"
+          : "fitted on " + Math.round(cal.edge_fit_ok_fraction * 100) + "% of " +
+            v(cal.edge_fit_attempts) + " attempts. Mean pupil <b>" + v(cal.mean_diameter_crop_px_edge) +
+            " px</b> against " + v(cal.mean_diameter_crop_px_area) + " px from the area method (same units now — they were not)" +
+            (cal.diameter_source === "edge" ? " (the edge fit produced this session's numbers)"
+              : " — the area method produced this session's numbers; the edge fit ran only for " +
+                "comparison") + ". It fits a circle to the pupil's boundary in the grey image " +
+            "instead of measuring the mask, so an eyelid removes boundary points rather than " +
+            "shrinking the answer. On synthetic eyes its bias is a quarter of the area method's; " +
+            "this row is where that gets tested on real faces. Points scatter " +
+            v(cal.edge_fit_mean_rms_px) + " px from the fitted circle, with " +
+            Math.round((cal.edge_fit_mean_support ?? 0) * 100) + "% of rays supporting it."}</td></tr>
+        <tr><th>Impossible sizes refused</th><td>${cal.readings_rejected_too_small == null
+          ? "\u2014 (this session predates the check)"
+          : v(cal.readings_rejected_too_small) + " too small, " + v(cal.readings_rejected_too_large) +
+            " too large, against a plausible range of " +
+            (cal.pupil_mm_bounds ? cal.pupil_mm_bounds.join(" to ") : "\u2014") + " pseudo-mm. " +
+            "A mask can collapse to a few pixels and convert to a pupil size no human has. " +
+            "These are refused rather than averaged in — but note WHERE they were lost: collapse " +
+            "happens when the pupil is small, so the loss falls on bright trials."}</td></tr>
+        <tr><th>Crop placement</th><td>${v(cal.roi_mode)}${cal.roi_mode === "iris" ? " x" + v(cal.roi_iris_margin) : ""}</td></tr>
+        <tr><th>Box smoothing</th><td>${v(cal.box_smoothing)} (re-locks ${v(cal.box_relocks)})</td></tr>
+        <tr><th>Pupil values in total</th><td>${v(pupil.valid_frames)} with both eyes
+          (${v(pupil.valid_frames_any_eye)} if one eye counts) at ${v(pupil.sampling_hz)} Hz</td></tr>
+        <tr><th>Both eyes measured</th><td>${pupil.both_eyes_fraction == null ? "—"
+          : Math.round(pupil.both_eyes_fraction * 100) + "% of readings"}
+          ${pupil.samples_left_eye_only || pupil.samples_right_eye_only
+            ? "(" + pupil.samples_left_eye_only + " left-only, " + pupil.samples_right_eye_only + " right-only)" : ""}</td></tr>
+        <tr><th>Difference between eyes</th><td>${pupil.eye_asymmetry_mean == null ? "—"
+          : v(pupil.eye_asymmetry_mean) + " (left minus right, both-eye readings only)"}</td></tr>
+      </table>
+
+      <p style="font-size:13px"><b>Read this before quoting the number.</b> The screen lights your face
+      as well as your eye, so some of any change is the image altering rather than your pupil. That
+      confound is shared with the published method and is why the verdict above is about direction and
+      rough size, not a calibrated measurement. Values are uncalibrated pseudo-millimetres: compare
+      within one person, never between people.</p>
+
+      <p><button id="dl">Download the full result (JSON)</button></p>
+      <p style="font-size:14px"><b>Last step:</b> send the downloaded file back to the person who sent you this link. That is the whole job — thank you!</p>
+    </div>`;
+
+  $("dl").addEventListener("click", () => {
+    /* A machine-readable per-participant verdict, so this can be used as a
+       screening step rather than something a human reads once. Record it beside
+       each participant's study data and exclude on `passes` — it says whether THIS
+       person's pupil measurement tracked a known physiological change, which no
+       amount of summary statistics from the study itself can tell you. */
+    const validity = {
+      measure: "pupil light reflex",
+      passes: pct != null && pct <= -5 && pairs >= 3 && constricted === pairs && separates,
+      /* Both conditions are stated, but be clear which one binds: SEPARATION does.
+         Across five sessions a per-cycle overlap of 12% or less went with
+         constrictions around -40%, while a -19% run scored 15% and a -9.6% run 17%.
+         So in practice this criterion demands a large reflex, not a 5% one. That is
+         deliberate — it is a floor on whether the measurement can resolve anything,
+         not a claim about how big a real pupil response should be — but a reader who
+         saw only "at least 5%" would badly misjudge how strict it is. */
+      criterion: "constriction of at least 5% on bright screens, in every cycle, with at least 3 " +
+                 "cycles, AND at most " + Math.round(OVERLAP_MAX * 100) + "% of bright readings " +
+                 "landing at or above the 25th percentile of the dark readings from the SAME cycle. " +
+                 "The separation condition is the binding one in practice.",
+      percent_change: pct == null ? null : Math.round(pct * 10) / 10,
+      cycles_constricted: constricted,
+      cycles_total: pairs,
+      /* The gate. Share of bright readings that failed to constrict — a
+         within-condition comparison, so a difference in means cannot manufacture it.
+         Across four runs from one person: 0.57, 0.26, 0.07, 0.05. */
+      /* Mean of the per-cycle overlaps; each bright period compared against the dark
+         period before it, so session drift cannot inflate it. Note the null value is
+         about 0.75, NOT 0 — identical distributions would put three quarters of bright
+         readings above the dark 25th percentile. */
+      overlap_bright_into_dark: overlap == null ? null : Math.round(overlap * 1000) / 1000,
+      overlap_per_cycle: cycleOverlaps.map((c) => Math.round(c.frac * 1000) / 1000),
+      overlap_cycles_used: cycleOverlaps.length,
+      overlap_null_value: 0.75,
+      overlap_cutoff_mm: overlapCut == null ? null : Math.round(overlapCut * 1000) / 1000,
+      separates: separates,
+      /* Per-reading precision, computed WITHIN each period. Reported, not gated:
+         it has been weak (0.14-0.46) in every run so far, including the good ones. */
+      eye_agreement_within_period: agreementWithin == null ? null : Math.round(agreementWithin * 1000) / 1000,
+      /* NOT a validity check, and kept only to keep the confound visible. Pooling
+         conditions puts the effect itself into the correlation, so this rises with
+         the effect size: 0.238/0.046/0.802/0.877 against -2.1/-8.1/-22.4/-41.4%.
+         An earlier version of this test gated on it and passed a run whose
+         within-condition agreement was 0.24. Do not use it. */
+      eye_agreement_pooled_CONFOUNDED: agreementPooled == null ? null : Math.round(agreementPooled * 1000) / 1000,
+      left_right_pairs: pairsLR,
+      strength: pct == null ? "no data" :
+                !separates ? "not trustworthy — the two conditions' readings overlap too much" :
+                pct <= -5 ? "usable" : pct <= -2 ? "too weak to trust" :
+                pct > 2 ? "wrong direction — tracking the image, not the pupil" : "no detectable reflex",
+      calibration_ok: !!(cal && cal.ok),
+      masks_rejected_fraction: cal && cal.masks_measured
+        ? Math.round(100 * cal.masks_rejected_shape / cal.masks_measured) / 100 : null,
+      both_eyes_fraction: pupil.both_eyes_fraction ?? null,
+      eye_asymmetry_mean: pupil.eye_asymmetry_mean ?? null,
+      // Non-random dropout: eyes are lost most when the pupil is small.
+      both_eyes_fraction_dark: covDark.frac == null ? null : Math.round(covDark.frac * 1000) / 1000,
+      both_eyes_fraction_bright: covBright.frac == null ? null : Math.round(covBright.frac * 1000) / 1000,
+      // Direction can be solid while the magnitude rests on very few readings.
+      thin_coverage_side: thinSide,
+      readings_in_sparsest_period: isFinite(thinnest) ? thinnest : null,
+      blobs_recentred: cal ? (cal.mask_blobs_recentred ?? null) : null,
+      blob_select: cal ? (cal.blob_select ?? null) : null,
+      // Lid clipping: how many readings a squint used to cost, and what the old
+      // area-based rule would have reported for the same masks.
+      diameter_source: cal ? (cal.diameter_source ?? null) : null,
+      masks_wide_kept: cal ? (cal.masks_wide_kept ?? null) : null,
+      masks_row_trimmed: cal ? (cal.masks_row_trimmed ?? null) : null,
+      mean_diameter_crop_px_width: cal ? (cal.mean_diameter_crop_px_width ?? null) : null,
+      // Physically impossible sizes refused. Concentrated on bright trials, because a
+      // constricted pupil is what collapses — so this is condition-dependent data loss.
+      fit_failed: cal ? (cal.fit_failed ?? null) : null,
+      // The edge-fit comparison, so it accumulates across sessions in saved data.
+      // Was the camera dimming, or the screen reflecting? Split by condition.
+      image_diagnostics_by_condition: imgDiag,
+      rejections_by_condition: rejDiag,
+      method_comparison_by_condition: methodCmp,
+      reflection_repair_by_condition: repDiag,
+      floor_pileup: floorPile,
+      precision_by_condition: precDiag,
+      camera_exposure_lock: exposureLock || null,
+      /* The raw evidence behind the binned tables above, kept so a question that only
+         comes up AFTER the run (as the reflection question did) can be answered from the
+         file instead of costing another session. frame_diagnostics has one entry per eye
+         per frame; rejection_events has one entry per refused reading, with the size,
+         eye, and the reflection measured on that same frame. */
+      frame_diagnostics: frameDiag || [],
+      rejection_events: rejects || [],
+      edge_fit_ok_fraction: cal ? (cal.edge_fit_ok_fraction ?? null) : null,
+      edge_fit_attempts: cal ? (cal.edge_fit_attempts ?? null) : null,
+      mean_diameter_crop_px_edge: cal ? (cal.mean_diameter_crop_px_edge ?? null) : null,
+      mean_diameter_crop_px_area: cal ? (cal.mean_diameter_crop_px_area ?? null) : null,
+      crop_px_to_pseudo_mm: cal ? (cal.crop_px_to_pseudo_mm ?? null) : null,
+      edge_fit_mean_support: cal ? (cal.edge_fit_mean_support ?? null) : null,
+      edge_fit_mean_rms_px: cal ? (cal.edge_fit_mean_rms_px ?? null) : null,
+      readings_rejected_too_fast: cal ? (cal.readings_rejected_too_fast ?? null) : null,
+      readings_rejected_eyes_disagree: cal ? (cal.readings_rejected_eyes_disagree ?? null) : null,
+      eye_difference_baseline: cal ? (cal.eye_difference_baseline ?? null) : null,
+      readings_rejected_too_small: cal ? (cal.readings_rejected_too_small ?? null) : null,
+      readings_rejected_too_large: cal ? (cal.readings_rejected_too_large ?? null) : null,
+      pupil_mm_bounds: cal ? (cal.pupil_mm_bounds ?? null) : null
+    };
+    const payload = { test: "pupil light reflex", finished_at: new Date().toISOString(),
+      design: { CAL_MS, PERIOD_MS, CYCLES, SKIP_MS, DARK, BRIGHT, OVERLAP_MAX },
+      validity,
+      summary: { dark_mean: dark, bright_mean: bright, percent_change: pct, constricted, pairs,
+                 // Same comparison with single-eye readings allowed, for reference.
+                 dark_mean_any_eye: darkAny, bright_mean_any_eye: brightAny,
+                 percent_change_any_eye: pctAny },
+      periods: rows, pupil, samples };
+    const b = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(b);
+    a.download = "pupil_light_reflex_" + pid + "_" + new Date().toISOString().replace(/[:.]/g, "-") + ".json";
+    document.body.appendChild(a); a.click(); a.remove();
+  });
+}
+</script>
+</body>
+</html>
