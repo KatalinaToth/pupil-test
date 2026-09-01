@@ -111,7 +111,7 @@ async function loadFresh(url) {
    (the code said `engine.getFrameDiagnostics ? ... : []`, which turned a missing feature
    into an empty array and then into a blank row in the table). */
 const REQUIRED_METHODS = ["getFrameDiagnostics", "getRejectionEvents"];
-const REQUIRED_STATS = ["mean_diameter_crop_px_area", "mean_diameter_crop_px_edge", "crop_px_to_pseudo_mm", "frame_diag_fields", "rejection_event_fields", "iris_source_px_mean"];
+const REQUIRED_STATS = ["mean_diameter_crop_px_area", "mean_diameter_crop_px_edge", "crop_px_to_pseudo_mm", "iris_px_recent", "frame_diag_fields", "rejection_event_fields", "iris_source_px_mean"];
 /* Fields this harness reads out of each per-frame diagnostic entry. The engine names what
    it records (frame_diag_fields), so an engine that predates a field is caught here — the
    presence of getFrameDiagnostics() alone proved insufficient the first time. */
@@ -119,6 +119,59 @@ const REQUIRED_FRAME_FIELDS = ["t", "ok", "interior", "exterior", "contrast", "b
 /* Same contract for rejection events: the damaged-or-real verdict reads the size, eye and
    reflection measured at the moment each reading was refused. */
 const REQUIRED_REJECT_FIELDS = ["t", "reason", "value", "eye", "bright", "contrast"];
+
+/* THE DISTANCE GATE. Added 1 Sep 2026, the day the first outside participant ran the
+   test: her camera saw her iris at 12.7 px — about half the resolution the pupil model
+   needs — and the page let her spend the full three minutes producing a file in which
+   every one of 723 readings was refused. The page had the number within seconds of the
+   camera opening. Every working run so far measured 22 px or more (23.3–31.4); the
+   failed run, 12.7. So the test now refuses to begin until the eye is large enough in
+   the picture, with a live meter while the person leans in. The gate opens at 18 px and
+   calls 22+ good. After 25 s of failure it offers "start anyway" — some setups (camera
+   across the desk, external monitor) cannot pass, and a stranger must never be trapped
+   on a screen with no exit. A forced start is recorded in the results file, so the
+   researcher knows the run was pre-doomed rather than mysteriously empty. */
+const GATE_MIN = 18, GATE_GOOD = 22;
+async function distanceGate(engine) {
+  $("stim").style.background = GREY;
+  const box = document.createElement("div");
+  box.style.cssText = "position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;color:#333;font-size:17px;text-align:center;padding:20px;z-index:5";
+  box.innerHTML =
+    '<div style="max-width:34em">One quick check: the camera needs your eyes big enough in its picture.</div>' +
+    '<div id="gateLabel" style="font-weight:600">Looking for your eyes\u2026</div>' +
+    '<div style="width:min(420px,80%);height:14px;border:1px solid #999;border-radius:7px;overflow:hidden;background:#ddd"><div id="gateBar" style="height:100%;width:0%;background:#b3452f;transition:width .3s,background .3s"></div></div>' +
+    '<button id="gateGo" disabled style="font-size:17px;padding:9px 22px">Start the test</button>' +
+    '<button id="gateAnyway" style="display:none;font-size:13px;background:none;border:none;color:#666;text-decoration:underline;cursor:pointer">I cannot get closer \u2014 start anyway (the result will be marked as too far)</button>';
+  $("stim").appendChild(box);
+  const t0 = performance.now();
+  let px = null, done = false, forced = false;
+  const finish = new Promise((res) => {
+    box.querySelector("#gateGo").addEventListener("click", () => { done = true; res(); });
+    box.querySelector("#gateAnyway").addEventListener("click", () => { forced = true; done = true; res(); });
+  });
+  (async () => {
+    while (!done) {
+      const cal = (engine.getCalibration && engine.getCalibration()) || {};
+      px = cal.iris_px_recent != null ? cal.iris_px_recent : null;
+      const bar = box.querySelector("#gateBar"), label = box.querySelector("#gateLabel");
+      const frac = px == null ? 0 : Math.min(px / GATE_GOOD, 1);
+      bar.style.width = Math.round(frac * 100) + "%";
+      bar.style.background = px == null ? "#b3452f" : px >= GATE_GOOD ? "#3f8f4f" : px >= GATE_MIN ? "#b3892f" : "#b3452f";
+      label.textContent = px == null ? "Looking for your eyes\u2026 (make sure your face is lit)"
+        : px >= GATE_GOOD ? "Distance is good \u2014 press Start."
+        : px >= GATE_MIN ? "This can work \u2014 a little closer is even better."
+        : "Too far \u2014 lean in until the bar fills (about an arm\u2019s length from the camera).";
+      box.querySelector("#gateGo").disabled = !(px != null && px >= GATE_MIN);
+      if (performance.now() - t0 > 25000) box.querySelector("#gateAnyway").style.display = "";
+      await sleep(500);
+    }
+  })();
+  await finish;
+  box.remove();
+  return { iris_px_at_start: px, seconds_at_gate: Math.round((performance.now() - t0) / 10) / 100, forced };
+}
+/* end distance gate */
+
 
 function engineApiProblems(engine) {
   const missing = [];
@@ -251,6 +304,7 @@ $("go").addEventListener("click", async () => {
     try { await document.documentElement.requestFullscreen({ navigationUI: "hide" }); } catch (e) { /* optional */ }
     $("intro").style.display = "none";
     $("stim").classList.add("on");
+    const gate = await distanceGate(engine);
 
     // ---- run the sequence, recording the real clock bounds of each period ----
     const periods = [];
@@ -301,14 +355,14 @@ $("go").addEventListener("click", async () => {
     const rejects = engine.getRejectionEvents();
     const result = await rec.stop();          // releases the camera
     try { if (document.fullscreenElement) await document.exitFullscreen(); } catch (e) { /* ignore */ }
-    report(result, rec, periods, frameDiag, rejects, exposureLock);
+    report(result, rec, periods, frameDiag, rejects, exposureLock, gate);
   } catch (err) {
     setStatus("Failed: " + (err && err.message ? err.message : err));
     try { if (rec) await rec.stop(); } catch (e) { /* ignore */ }
   }
 });
 
-function report(result, rec, periods, frameDiag, rejects, exposureLock) {
+function report(result, rec, periods, frameDiag, rejects, exposureLock, gate) {
   const pupil = result.pupil || {};
   const cal = pupil.calibration || {};
   const samples = rec.getPupilSamples() || { t_sec: [], mean_mm: [], blink: [] };
@@ -889,6 +943,13 @@ function report(result, rec, periods, frameDiag, rejects, exposureLock) {
     <div class="panel">
       <h1>Result</h1>
       <div class="verdict ${cls}">${verdict}</div>
+      ${(gate && gate.forced) || (cal.iris_source_px_mean != null && cal.iris_source_px_mean < GATE_MIN)
+        ? `<div class="verdict weak">The camera saw your iris at ${cal.iris_source_px_mean} pixels — the
+           test needs about ${GATE_MIN} or more, and every run that worked had 22+. At this distance a
+           result cannot be trusted in either direction${gate && gate.forced
+             ? " (the distance check was skipped with \u201cstart anyway\u201d)" : ""}.
+           Sitting about an arm\u2019s length from the camera and re-running is the fix.</div>`
+        : ""}
       ${thinSide ? `<div class="verdict weak">Thin data on one side. Only
         ${Math.round((thinSide === "bright" ? covBright.frac : covDark.frac) * 100)}% of your
         ${thinSide}-screen readings had both eyes, and the sparsest period rests on just
@@ -922,9 +983,9 @@ function report(result, rec, periods, frameDiag, rejects, exposureLock) {
             ? " — the rest had too few readings to compare, so this figure rests on less than the whole session"
             : ""}</td></tr>
         <tr><th>Iris size in the picture</th><td>${cal.iris_source_px_mean == null ? "—"
-          : cal.iris_source_px_mean + " px" + (cal.iris_source_px_mean < 20
+          : cal.iris_source_px_mean + " px" + (cal.iris_source_px_mean < GATE_MIN
             ? " <b>&larr; too far from the camera; nothing below is trustworthy</b>"
-            : cal.iris_source_px_mean < 25 ? " (marginal — sit closer if possible)" : " (good)")}</td></tr>
+            : cal.iris_source_px_mean < GATE_GOOD ? " (marginal — sit closer if possible)" : " (good)")}</td></tr>
         <tr><th>Both eyes measured, dark screens</th><td>${covDark.frac == null ? "—"
           : Math.round(covDark.frac * 100) + "% (" + covDark.both + " of " + covDark.all + ")"}</td></tr>
         <tr><th>Both eyes measured, bright screens</th><td>${covBright.frac == null ? "—"
@@ -1398,6 +1459,7 @@ function report(result, rec, periods, frameDiag, rejects, exposureLock) {
     const payload = { test: "pupil light reflex", participant: pid, finished_at: new Date().toISOString(),
       effort,
       design: { CAL_MS, PERIOD_MS, CYCLES, SKIP_MS, DARK, BRIGHT, OVERLAP_MAX },
+      distance_gate: gate || null,
       validity,
       summary: { dark_mean: dark, bright_mean: bright, percent_change: pct, constricted, pairs,
                  // Same comparison with single-eye readings allowed, for reference.
