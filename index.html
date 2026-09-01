@@ -1121,7 +1121,17 @@ function report(result, rec, periods, frameDiag, rejects, exposureLock, gate) {
         ? "<b>The methods split apart on bright screens specifically</b> (" + fmt(d.dark)
           + "% dark vs " + fmt(d.bright) + "% bright). Something bright-specific is shaving the"
           + " counted pupil without moving its edge — a fainter boundary, a reflection, or a lid."
-          + " The edge figure (" + fmt(c.edge) + "%) is the better estimate of your true change."
+          + (imgDiag && imgDiag.brightInside && imgDiag.brightInside.bright > 0.03
+            ? " And it is measurably the reflection here: on bright screens, "
+              + Math.round(imgDiag.brightInside.bright * 100) + "% of the pixels inside the fitted"
+              + " pupil circle were reflection-bright (dark screens: "
+              + Math.round((imgDiag.brightInside.dark || 0) * 100) + "%). The screen lights the eye,"
+              + " the reflection sits ON the pupil, and the model refuses those pixels — seen live"
+              + " on the viewer, 1 Sep 2026."
+            : "")
+          + " The edge figure (" + fmt(c.edge) + "%) is the better estimate of your true change —"
+          + " though when the reflection covers a large share of the pupil, expect even the edge"
+          + " figure to run a few points strong: the true change is, if anything, slightly smaller."
         : gap < -4
         ? "<b>They disagree more on DARK screens</b>, which none of the known camera problems"
           + " predicts. Treat both figures with caution and flag this run."
@@ -1479,6 +1489,8 @@ function report(result, rec, periods, frameDiag, rejects, exposureLock, gate) {
       effort,
       design: { CAL_MS, PERIOD_MS, CYCLES, SKIP_MS, DARK, BRIGHT, OVERLAP_MAX },
       distance_gate: gate || null,
+      /* Files saved before 1 Sep 2026 have these two SWAPPED (camera-relative names). */
+      eye_labels: "anatomical: left_mm is the participant's own left eye (corrected 1 Sep 2026)",
       camera: (() => {
         const c = rec.getCameraSettings ? rec.getCameraSettings() : null;
         return c ? { width: c.width || null, height: c.height || null,

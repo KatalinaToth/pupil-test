@@ -1,4 +1,4 @@
-Pupil pilot bundle — built 2026-09-01T17:44:46.151Z
+Pupil pilot bundle — built 2026-09-01T18:17:55.883Z
 
 Host this folder on any HTTPS static host (GitHub Pages: put these files in a public
 repository, Settings -> Pages -> deploy from branch). Send participants the URL.
