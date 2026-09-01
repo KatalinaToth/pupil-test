@@ -132,17 +132,26 @@ const REQUIRED_REJECT_FIELDS = ["t", "reason", "value", "eye", "bright", "contra
    on a screen with no exit. A forced start is recorded in the results file, so the
    researcher knows the run was pre-doomed rather than mysteriously empty. */
 const GATE_MIN = 18, GATE_GOOD = 22;
-async function distanceGate(engine) {
+async function distanceGate(engine, cam) {
   $("stim").style.background = GREY;
   const box = document.createElement("div");
   box.style.cssText = "position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;color:#333;font-size:17px;text-align:center;padding:20px;z-index:5";
   box.innerHTML =
     '<div style="max-width:34em">One quick check: the camera needs your eyes big enough in its picture.</div>' +
     '<div id="gateLabel" style="font-weight:600">Looking for your eyes\u2026</div>' +
+    '<div id="gateCam" style="font-size:13px;color:#666"></div>' +
     '<div style="width:min(420px,80%);height:14px;border:1px solid #999;border-radius:7px;overflow:hidden;background:#ddd"><div id="gateBar" style="height:100%;width:0%;background:#b3452f;transition:width .3s,background .3s"></div></div>' +
     '<button id="gateGo" disabled style="font-size:17px;padding:9px 22px">Start the test</button>' +
     '<button id="gateAnyway" style="display:none;font-size:13px;background:none;border:none;color:#666;text-decoration:underline;cursor:pointer">I cannot get closer \u2014 start anyway (the result will be marked as too far)</button>';
   $("stim").appendChild(box);
+  /* Name the camera's picture size up front: a small picture and a large distance
+     produce the SAME too-small iris, and the person at the keyboard can only fix one
+     of them. (First pilot: a 12.7 px iris that could have been either — the file
+     recorded neither the granted resolution nor this distinction.) */
+  const lowRes = !!(cam && cam.height && cam.height <= 480);
+  box.querySelector("#gateCam").textContent = cam && cam.width
+    ? "Camera picture: " + cam.width + "\u00d7" + cam.height + (lowRes ? " \u2014 on the small side, so you will need to be quite close" : "")
+    : "";
   const t0 = performance.now();
   let px = null, done = false, forced = false;
   const finish = new Promise((res) => {
@@ -160,6 +169,7 @@ async function distanceGate(engine) {
       label.textContent = px == null ? "Looking for your eyes\u2026 (make sure your face is lit)"
         : px >= GATE_GOOD ? "Distance is good \u2014 press Start."
         : px >= GATE_MIN ? "This can work \u2014 a little closer is even better."
+        : lowRes ? "Too far for this camera\u2019s small picture \u2014 you will need to be very close (about 25 cm / 10 inches)."
         : "Too far \u2014 lean in until the bar fills (about an arm\u2019s length from the camera).";
       box.querySelector("#gateGo").disabled = !(px != null && px >= GATE_MIN);
       if (performance.now() - t0 > 25000) box.querySelector("#gateAnyway").style.display = "";
@@ -304,7 +314,7 @@ $("go").addEventListener("click", async () => {
     try { await document.documentElement.requestFullscreen({ navigationUI: "hide" }); } catch (e) { /* optional */ }
     $("intro").style.display = "none";
     $("stim").classList.add("on");
-    const gate = await distanceGate(engine);
+    const gate = await distanceGate(engine, rec.getCameraSettings ? rec.getCameraSettings() : null);
 
     // ---- run the sequence, recording the real clock bounds of each period ----
     const periods = [];
@@ -982,6 +992,13 @@ function report(result, rec, periods, frameDiag, rejects, exposureLock, gate) {
           cycleOverlaps.length < CYCLES
             ? " — the rest had too few readings to compare, so this figure rests on less than the whole session"
             : ""}</td></tr>
+        <tr><th>Camera picture</th><td>${(() => {
+          const c = rec.getCameraSettings ? rec.getCameraSettings() : null;
+          if (!c || !c.width) return "not reported by this browser";
+          return c.width + "\u00d7" + c.height + (c.height <= 480
+            ? " <b>&larr; small — this alone forces sitting very close (~25 cm)</b>"
+            : c.height >= 1080 ? " (good)" : " (fine)");
+        })()}</td></tr>
         <tr><th>Iris size in the picture</th><td>${cal.iris_source_px_mean == null ? "—"
           : cal.iris_source_px_mean + " px" + (cal.iris_source_px_mean < GATE_MIN
             ? " <b>&larr; too far from the camera; nothing below is trustworthy</b>"
@@ -1460,6 +1477,11 @@ function report(result, rec, periods, frameDiag, rejects, exposureLock, gate) {
       effort,
       design: { CAL_MS, PERIOD_MS, CYCLES, SKIP_MS, DARK, BRIGHT, OVERLAP_MAX },
       distance_gate: gate || null,
+      camera: (() => {
+        const c = rec.getCameraSettings ? rec.getCameraSettings() : null;
+        return c ? { width: c.width || null, height: c.height || null,
+                     frame_rate: c.frameRate ? Math.round(c.frameRate) : null } : null;
+      })(),
       validity,
       summary: { dark_mean: dark, bright_mean: bright, percent_change: pct, constricted, pairs,
                  // Same comparison with single-eye readings allowed, for reference.
