@@ -40,11 +40,14 @@
   ordinary webcam. Your pupils shrink when the screen gets brighter — it happens on its
   own, you cannot get it wrong — and the software has to see that happen.</p>
 
-  <h2>What will happen — about 2 minutes</h2>
+  <h2>What will happen — about 3 minutes</h2>
   <ul>
     <li>The page goes full screen and asks to use your camera.</li>
     <li>A grey screen for 15 seconds while it calibrates.</li>
     <li>Then it alternates <b>dark</b> and <b>bright</b> screens, 10 seconds each, four times.</li>
+    <li>Then the screen stays grey while you rest half a minute, and finally count
+    backwards in your head for 45 seconds. That part tests the pupil without any
+    light change at all.</li>
     <li>Look at the cross in the middle, blink normally. If the bright screens make you
     squint, squint — that is fine and useful.</li>
   </ul>
@@ -69,7 +72,7 @@
   <p id="status" style="font-size:13px"></p>
   <div id="stale" class="verdict bad" style="display:none"></div>
 </div></div>
-<div id="stim"><div id="cross">+</div></div>
+<div id="stim"><div id="cross">+</div><div id="taskText" style="position:fixed;left:50%;top:62%;transform:translateX(-50%);max-width:520px;text-align:center;font-size:15px;color:#5a5a5a"></div></div>
 <div id="phase"></div>
 <div id="report" style="display:none"></div>
 
@@ -79,6 +82,7 @@
 // Periods, in order. Grey first so calibration happens under neutral light, as it
 // would in a real study; then four dark/bright pairs.
 const CAL_MS = 15000, PERIOD_MS = 10000, CYCLES = 4;
+const EFFORT_REST_MS = 30000, EFFORT_TASK_MS = 45000;
 const DARK = "#101010", BRIGHT = "#ededed", GREY = "rgb(128,128,128)";
 // Discarded at the start of each period: the reflex takes a moment, and the first
 // second after a big luminance step is a transient, not a level.
@@ -233,9 +237,18 @@ $("go").addEventListener("click", async () => {
     await rec.init();
     if (!engine.ready) { setStatus("The pupil model did not load: " + engine.loadError); return; }
 
-    try { await document.documentElement.requestFullscreen({ navigationUI: "hide" }); } catch (e) { /* optional */ }
     setStatus("Asking for the camera…");
-    await rec.start();                       // opens the webcam
+    await rec.start();                       // opens the webcam; the permission prompt
+                                             // exits fullscreen on first visit, which is
+                                             // why fullscreen is requested on the NEXT
+                                             // click instead of here
+    setStatus("");
+    const startBtn = document.createElement("button");
+    startBtn.textContent = "Camera is on — press to start";
+    $("status").after(startBtn);
+    await new Promise((res) => startBtn.addEventListener("click", res, { once: true }));
+    startBtn.remove();
+    try { await document.documentElement.requestFullscreen({ navigationUI: "hide" }); } catch (e) { /* optional */ }
     $("intro").style.display = "none";
     $("stim").classList.add("on");
 
@@ -265,6 +278,18 @@ $("go").addEventListener("click", async () => {
       await runPeriod("dark", DARK, PERIOD_MS);
       await runPeriod("bright", BRIGHT, PERIOD_MS);
     }
+    /* THE ISOLUMINANT CONTROL (added 1 Sep 2026, after the user's point that a single
+       light-driven test cannot separate "measures pupils" from "measures something
+       about light"). Mental effort dilates the pupil at CONSTANT luminance (Hess &
+       Polt 1964; Kahneman & Beatty 1966; the mEye paper's own cognitive validation is
+       the same principle in event form). Both periods below share the identical grey
+       background; only the instruction differs — so a brightness artefact CANNOT
+       produce this effect, and seeing it is evidence the pupil itself is measured. */
+    $("taskText").textContent = "Just relax and keep looking at the cross.";
+    await runPeriod("effort_rest", GREY, EFFORT_REST_MS);
+    $("taskText").textContent = "Now count backwards from 843 by 7s, silently, as fast as you can. Keep going until the screen changes.";
+    await runPeriod("effort_task", GREY, EFFORT_TASK_MS);
+    $("taskText").textContent = "";
     await lockTask;
 
     $("stim").classList.remove("on");
@@ -474,6 +499,7 @@ function report(result, rec, periods, frameDiag, rejects, exposureLock) {
     for (const p of periods) {
       if (p.kind === "calibration") continue;
       const from = (p.t0 + SKIP_MS) / 1000, to = p.t1 / 1000;
+      if (!(p.kind in g)) continue;
       for (const f of frameDiag) {
         if (f.t < from || f.t > to) continue;
         if (f.ok) g[p.kind].push(f);
@@ -516,6 +542,7 @@ function report(result, rec, periods, frameDiag, rejects, exposureLock) {
     for (const p of periods) {
       if (p.kind === "calibration") continue;
       const from = (p.t0 + SKIP_MS) / 1000, to = p.t1 / 1000;
+      if (!(p.kind in g)) continue;
       for (const f of frameDiag)
         if (f.t >= from && f.t <= to && f.ok && f.dEdgePx != null && f.dAreaPx > 0) g[p.kind].push(f);
     }
@@ -552,6 +579,7 @@ function report(result, rec, periods, frameDiag, rejects, exposureLock) {
       const from = (p.t0 + SKIP_MS) / 1000, to = p.t1 / 1000;
       for (const f of frameDiag) {
         if (f.t < from || f.t > to || typeof f.dAreaRawPx !== "number") continue;
+        if (!(p.kind in g)) continue;
         const b = g[p.kind];
         b.frames++; b.dSum += f.dAreaPx; b.dRawSum += f.dAreaRawPx;
         if (f.repairPx > 0) { b.repaired++; b.px += f.repairPx; }
@@ -648,6 +676,29 @@ function report(result, rec, periods, frameDiag, rejects, exposureLock) {
     return out;
   })();
 
+  /* THE ISOLUMINANT EFFORT CHECK: mean pupil while counting backwards vs resting,
+     both on the identical grey. Positive = dilation, the direction 60 years of
+     literature guarantees for mental effort. This is the control that a light artefact
+     cannot fake: nothing about the light changed. Magnitude expectation is modest
+     (a few percent, engagement-dependent) so it is graded as its own line of evidence,
+     not folded into the light-reflex verdict. */
+  const effort = (() => {
+    const win = (kind) => {
+      const p = periods.find((q) => q.kind === kind);
+      if (!p) return null;
+      const vals = [];
+      for (let i = 0; i < t.length; i++) {
+        if (t[i] >= (p.t0 + SKIP_MS) / 1000 && t[i] <= p.t1 / 1000 && mm[i] != null) vals.push(mm[i]);
+      }
+      return vals.length >= 8 ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
+    };
+    const rest = win("effort_rest"), task = win("effort_task");
+    if (rest == null || task == null) return null;
+    return { rest_mean: +rest.toFixed(4), task_mean: +task.toFixed(4),
+             change_pct: +((100 * (task - rest)) / rest).toFixed(2),
+             dilated: task > rest };
+  })();
+
   /* FLOOR PILE-UP CHECK. The size floor is meant to catch garbage (collapsed masks
      measure ~0.5-0.85), never to trim the real distribution — but the pseudo-mm scale
      moves between sessions, so a fixed floor CAN drift into the real data. The
@@ -666,6 +717,7 @@ function report(result, rec, periods, frameDiag, rejects, exposureLock) {
       for (let i = 0; i < t.length; i++) {
         if (t[i] < from || t[i] > to) continue;
         for (const x of [lft[i], rgt[i]]) if (x != null) {
+          if (!(p.kind in g)) break;
           g[p.kind].all++;
           if (x <= floor + BAND) g[p.kind].near++;
         }
@@ -699,6 +751,7 @@ function report(result, rec, periods, frameDiag, rejects, exposureLock) {
         if (e.t >= (p.t0 + SKIP_MS) / 1000 && e.t <= p.t1 / 1000) { where = p.kind; break; }
       }
       if (!where) { outside++; continue; }
+      if (!(where in g)) { outside++; continue; }
       g[where][e.reason] = (g[where][e.reason] || 0) + 1;
       if (typeof e.value === "number") (vals[where][e.reason] = vals[where][e.reason] || []).push(e.value);
       if (typeof e.bright === "number") (brights[where][e.reason] = brights[where][e.reason] || []).push(e.bright);
@@ -853,6 +906,18 @@ function report(result, rec, periods, frameDiag, rejects, exposureLock) {
         <tr><th>Both eyes measured, bright screens</th><td>${covBright.frac == null ? "—"
           : Math.round(covBright.frac * 100) + "% (" + covBright.both + " of " + covBright.all + ")"}</td></tr>
       </table>
+      <h2>The second test: effort, with the light held constant</h2>
+      ${effort ? `
+      <p style="font-size:13.5px">For the last part you counted backwards on a screen that never
+      changed brightness. Mental effort dilates pupils — it cannot be faked by anything about the
+      light, because nothing about the light happened. Resting: <b>${effort.rest_mean.toFixed(2)}</b>;
+      counting: <b>${effort.task_mean.toFixed(2)}</b> — a change of
+      <b>${effort.change_pct >= 0 ? "+" : ""}${effort.change_pct.toFixed(1)}%</b>.
+      ${effort.dilated
+        ? "<b>Dilation, as the literature predicts.</b> Together with the light reflex above, the two responses have opposite directions and different causes — a camera or lighting artefact cannot produce both."
+        : "No dilation this run. This check is modest and depends on actually doing the counting; a flat result weakens nothing above, but a dilation would have been extra evidence."}</p>` : `
+      <p style="font-size:13.5px">Not measured this run (effort periods missing or too sparse).</p>`}
+
       <h2>Is it your pupil, or the camera?</h2>
       <p style="font-size:13px"><b>Camera brightness lock:</b> ${!exposureLock || !exposureLock.attempted
         ? "not attempted this run."
@@ -1302,7 +1367,10 @@ function report(result, rec, periods, frameDiag, rejects, exposureLock) {
       readings_rejected_too_large: cal ? (cal.readings_rejected_too_large ?? null) : null,
       pupil_mm_bounds: cal ? (cal.pupil_mm_bounds ?? null) : null
     };
-    const payload = { test: "pupil light reflex", finished_at: new Date().toISOString(),
+    const pid = (document.getElementById("pid") && document.getElementById("pid").value || "")
+      .trim().replace(/[^A-Za-z0-9_-]/g, "").slice(0, 24) || "anonymous";
+    const payload = { test: "pupil light reflex", participant: pid, finished_at: new Date().toISOString(),
+      effort,
       design: { CAL_MS, PERIOD_MS, CYCLES, SKIP_MS, DARK, BRIGHT, OVERLAP_MAX },
       validity,
       summary: { dark_mean: dark, bright_mean: bright, percent_change: pct, constricted, pairs,
