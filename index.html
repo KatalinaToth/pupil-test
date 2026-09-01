@@ -62,7 +62,9 @@
   <p><b>Privacy:</b> the camera turns on when you press Begin and is released the moment
   the test ends. <b>No video is recorded and nothing is uploaded anywhere</b> — the page
   computes numbers on your machine, and at the end you download a small results file and
-  send it back yourself.</p>
+  send it back yourself. So we can diagnose problems from afar, that file also notes basic
+  facts about your setup: browser, screen size, and your camera's name and picture size —
+  the kind of thing any website can see.</p>
 
   <p>A name or initials for your results file (so we know whose it is):<br>
   <input id="pid" type="text" maxlength="24" placeholder="e.g. GK"
@@ -995,7 +997,7 @@ function report(result, rec, periods, frameDiag, rejects, exposureLock, gate) {
         <tr><th>Camera picture</th><td>${(() => {
           const c = rec.getCameraSettings ? rec.getCameraSettings() : null;
           if (!c || !c.width) return "not reported by this browser";
-          return c.width + "\u00d7" + c.height + (c.height <= 480
+          return c.width + "\u00d7" + c.height + (c.label ? " (" + c.label + ")" : "") + (c.height <= 480
             ? " <b>&larr; small — this alone forces sitting very close (~25 cm)</b>"
             : c.height >= 1080 ? " (good)" : " (fine)");
         })()}</td></tr>
@@ -1480,8 +1482,25 @@ function report(result, rec, periods, frameDiag, rejects, exposureLock, gate) {
       camera: (() => {
         const c = rec.getCameraSettings ? rec.getCameraSettings() : null;
         return c ? { width: c.width || null, height: c.height || null,
-                     frame_rate: c.frameRate ? Math.round(c.frameRate) : null } : null;
+                     frame_rate: c.frameRate ? Math.round(c.frameRate) : null,
+                     label: c.label || null } : null;
       })(),
+      /* The machine, for diagnosing a bad file without a conversation: browser+OS
+         (raw user agent — parsing it loses information), the screen the stimulus
+         ran on, pixel density, a phone/tablet hint, core count, and the clock's
+         offset from UTC (so "was this run in the evening?" is answerable). All of
+         it is visible to any website; it is recorded here because a results file
+         that cannot name its own environment cannot be debugged from afar. */
+      environment: {
+        user_agent: navigator.userAgent,
+        screen_w: (screen && screen.width) || null,
+        screen_h: (screen && screen.height) || null,
+        device_pixel_ratio: window.devicePixelRatio || null,
+        window_w: innerWidth, window_h: innerHeight,
+        max_touch_points: navigator.maxTouchPoints || 0,
+        cpu_cores: navigator.hardwareConcurrency || null,
+        tz_offset_min: new Date().getTimezoneOffset()
+      },
       validity,
       summary: { dark_mean: dark, bright_mean: bright, percent_change: pct, constricted, pairs,
                  // Same comparison with single-eye readings allowed, for reference.
