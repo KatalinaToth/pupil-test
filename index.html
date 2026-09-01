@@ -708,11 +708,18 @@ function report(result, rec, periods, frameDiag, rejects, exposureLock) {
     if (rest == null || task == null) return null;
     const d = task.m - rest.m;
     const seD = Math.sqrt(rest.se * rest.se + task.se * task.se);
+    /* The callable bar is 2SE — but with an absolute floor of 1% of the rest mean.
+       Without the floor there is a degenerate hole: a frozen camera (or any pathology
+       that repeats near-identical frames) collapses the variance, the noise bar
+       collapses with it, and an arbitrarily tiny drift would be graded "dilated".
+       Real effort effects run ~3-8%, so a 1% floor costs nothing detectable. */
+    const bar = Math.max(2 * seD, 0.01 * rest.m);
     return { rest_mean: +rest.m.toFixed(4), task_mean: +task.m.toFixed(4),
              change_pct: +((100 * d) / rest.m).toFixed(2),
              se_change_pct: +((100 * (2 * seD)) / rest.m).toFixed(2),
+             call_threshold_pct: +((100 * bar) / rest.m).toFixed(2),
              n_rest: rest.n, n_task: task.n,
-             verdict: d > 2 * seD ? "dilated" : d < -2 * seD ? "constricted" : "too_small_to_call",
+             verdict: d > bar ? "dilated" : d < -bar ? "constricted" : "too_small_to_call",
              dilated: d > 2 * seD };
   })();
 
@@ -730,11 +737,11 @@ function report(result, rec, periods, frameDiag, rejects, exposureLock) {
     const g = { dark: { near: 0, all: 0 }, bright: { near: 0, all: 0 } };
     for (const p of periods) {
       if (p.kind === "calibration") continue;
+      if (!(p.kind in g)) continue;
       const from = (p.t0 + SKIP_MS) / 1000, to = p.t1 / 1000;
       for (let i = 0; i < t.length; i++) {
         if (t[i] < from || t[i] > to) continue;
         for (const x of [lft[i], rgt[i]]) if (x != null) {
-          if (!(p.kind in g)) break;
           g[p.kind].all++;
           if (x <= floor + BAND) g[p.kind].near++;
         }
@@ -931,10 +938,10 @@ function report(result, rec, periods, frameDiag, rejects, exposureLock) {
       counting: <b>${effort.task_mean.toFixed(2)}</b> — a change of
       <b>${effort.change_pct >= 0 ? "+" : ""}${effort.change_pct.toFixed(1)}%</b>.
       ${effort.verdict === "dilated"
-        ? "<b>Dilation, clear of this run's own noise (±" + effort.se_change_pct.toFixed(1) + "%).</b> Together with the light reflex above, the two responses have opposite directions and different causes — a camera or lighting artefact cannot produce both."
+        ? "<b>Dilation, clear of this run's own noise (±" + effort.call_threshold_pct.toFixed(1) + "%).</b> Together with the light reflex above, the two responses have opposite directions and different causes — a camera or lighting artefact cannot produce both."
         : effort.verdict === "constricted"
         ? "<b>Constriction — the opposite of what effort should do.</b> Worth checking whether the counting actually happened, and whether the eyes stayed on the cross."
-        : "<b>Too small to call:</b> at this run's precision a change would need to exceed ±" + effort.se_change_pct.toFixed(1) + "% to mean anything, and " + (effort.change_pct >= 0 ? "+" : "") + effort.change_pct.toFixed(1) + "% does not. A flat result here weakens nothing above — but no credit is claimed for it either. Counting harder (genuinely fast, eyes on the cross) usually raises the effect."}</p>` : `
+        : "<b>Too small to call:</b> at this run's precision a change would need to exceed ±" + effort.call_threshold_pct.toFixed(1) + "% to mean anything, and " + (effort.change_pct >= 0 ? "+" : "") + effort.change_pct.toFixed(1) + "% does not. A flat result here weakens nothing above — but no credit is claimed for it either. Counting harder (genuinely fast, eyes on the cross) usually raises the effect."}</p>` : `
       <p style="font-size:13.5px">Not measured this run (effort periods missing or too sparse).</p>`}
 
       <h2>Is it your pupil, or the camera?</h2>
