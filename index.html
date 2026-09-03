@@ -1489,8 +1489,11 @@ function report(result, rec, periods, frameDiag, rejects, exposureLock, gate) {
       effort,
       design: { CAL_MS, PERIOD_MS, CYCLES, SKIP_MS, DARK, BRIGHT, OVERLAP_MAX },
       distance_gate: gate || null,
-      /* Files saved before 1 Sep 2026 have these two SWAPPED (camera-relative names). */
-      eye_labels: "anatomical: left_mm is the participant's own left eye (corrected 1 Sep 2026)",
+      /* Camera-relative, as in every file before 1 Sep 2026 evening: "left" is the eye on
+         the image's LEFT, i.e. the participant's RIGHT eye on an unmirrored webcam. The
+         anatomical relabel was reverted with the rest of that evening's engine changes
+         pending one-at-a-time re-validation. */
+      eye_labels: "camera-relative: left_mm is the eye on the image's left = the participant's RIGHT eye",
       camera: (() => {
         const c = rec.getCameraSettings ? rec.getCameraSettings() : null;
         return c ? { width: c.width || null, height: c.height || null,
